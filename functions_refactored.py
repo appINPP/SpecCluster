@@ -5,6 +5,7 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import h5py
 from PyMca5.PyMcaIO.OutputBuffer import OutputBuffer
 from PyMca5.PyMcaPhysics.xrf.FastXRFLinearFit import FastXRFLinearFit
@@ -15,7 +16,8 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView, 
     QHBoxLayout, QAbstractItemView, QTableWidget,
     QTableWidgetItem, QComboBox, QDoubleSpinBox,
-    QGraphicsView, QGraphicsScene,QToolBar
+    QGraphicsView, QGraphicsScene,QToolBar, QTabWidget,
+    QFormLayout, QSpinBox, QSizePolicy
     )
 from PySide6.QtGui import QPixmap, QImage, QPainter, QFont, QGuiApplication, QAction
 from PySide6.QtCore import Qt, Signal, QSignalBlocker, QTimer,QEvent, QPointF, QSize, QCoreApplication
@@ -25,6 +27,12 @@ from esda.moran import Moran
 from sklearn.cluster import KMeans
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import LogLocator, NullFormatter, MaxNLocator
+
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from matplotlib.widgets import RectangleSelector, SpanSelector
+from matplotlib.backend_bases import MouseButton
+import time
 
 def _process_images_df(df_raw):
     # identical to what you do after reading IMAGES/images.csv
@@ -88,7 +96,23 @@ def elemental_conversion_qt(parent=None, save_raw: bool = False):
 
         with h5py.File(hdf_file, 'r') as f:
             data = np.array(f[dataset_path])
+            if parent is not None:
+                arr = data.reshape(-1, data.shape[-1])
+                parent.pipeline_config["raw_spectra"] = arr         # (N_pixels, n_channels)
+                # Try to discover an energy axis; otherwise we’ll plot by channel index
+                eng = None
+                try:
+                    ds = f[dataset_path]
+                    for key in ("energy", "energies", "xrf_energies"):
+                        if key in ds.attrs:
+                            e = np.asarray(ds.attrs[key]).astype(float)
+                            # guess units (eV vs keV)
+                            eng = e / 1000.0 if np.nanmax(e) > 5000 else e
+                            break
+                except Exception:
+                    pass
 
+        parent.pipeline_config["energy_keV"] = eng
         fast_fit = FastXRFLinearFit()
         fast_fit.setFitConfigurationFile(cfg_file)
         fast_fit.fitMultipleSpectra(y=data, weight=0, outbuffer=output)
@@ -464,18 +488,24 @@ class ElementImageSelectionDialog(QDialog):
 
     # ---------- Ranges ----------
     def _compute_global_range(self):
-        if not self._range_dirty: return
+        if not self._range_dirty:
+            return
         self._range_dirty = False
+
         if not self._raw or self._norm_mode == "Per image":
-            self._global_min = self._global_max = None; return
+            self._global_min = self._global_max = None
+            return
+
+        # Always build stack in LINEAR domain (clip for log)
         eps = float(self._log_eps)
-        if self._scale_mode == "Log10":
-            stack = np.concatenate([np.log10(np.clip(a, eps, None)).ravel() for a in self._raw.values()])
-        else:
-            stack = np.concatenate([a.ravel() for a in self._raw.values()])
+        arrays = [ (np.clip(a, eps, None) if self._scale_mode == "Log10" else a).ravel()
+                for a in self._raw.values() ]
+        stack = np.concatenate(arrays)
+
         if self._norm_mode == "Global min/max":
-            self._global_min, self._global_max = float(np.nanmin(stack)), float(np.nanmax(stack))
-        else:
+            self._global_min = float(np.nanmin(stack))
+            self._global_max = float(np.nanmax(stack))
+        else:  # Global percentile
             self._global_min = float(np.nanpercentile(stack, self._pct_lo))
             self._global_max = float(np.nanpercentile(stack, self._pct_hi))
 
@@ -545,43 +575,51 @@ class ElementImageSelectionDialog(QDialog):
             return lo, hi
         return self._global_min, self._global_max
 
-    def _render_thumb(self, el):
-        img = self._raw[el]
-
-        # choose domain (linear/log) for range + labels
-        if self._scale_mode == "Log10":
-            arr = np.log10(np.clip(img, float(self._log_eps), None))
+    def _v_range_lin(self, img_linear):
+        """Return vmin/vmax in LINEAR domain for current norm mode."""
+        if self._norm_mode == "Per image":
+            lo, hi = np.nanpercentile(img_linear, 2), np.nanpercentile(img_linear, 98)
+            if lo == hi:
+                lo, hi = float(np.nanmin(img_linear)), float(np.nanmax(img_linear))
+            return lo, hi
         else:
-            arr = img.astype(float, copy=False)
+            return self._global_min, self._global_max
+        
+    def _render_thumb(self, el):
+        img_lin = self._raw[el].astype(float, copy=False)
 
-        # compute vmin/vmax in that domain
-        vmin, vmax = self._v_range_for(arr)
+        # vmin/vmax in LINEAR domain
+        eps = float(self._log_eps)
+        base = np.clip(img_lin, eps, None) if self._scale_mode == "Log10" else img_lin
+        vmin, vmax = self._v_range_lin(base)
 
-        # fetch/create pixmap
+        # cache key only on settings; data/range are reproducible given settings
         settings_id = (self._cmap, self._norm_mode, round(self._pct_lo,2), round(self._pct_hi,2),
-                       self._scale_mode, round(float(self._log_eps), 12), 140)
+                    self._scale_mode, round(eps, 12), 140)
         key = (el, settings_id)
         pm = self._thumb_cache.get(key)
         if pm is None:
-            # normalize to 0..255
-            if vmin is None or vmax is None or not np.isfinite([vmin, vmax]).all() or vmin == vmax:
-                vmin, vmax = 0.0, 1.0
-            norm = (arr - vmin) / (vmax - vmin + 1e-12)
-            idx = np.clip((norm * 255.0).round().astype(np.uint8), 0, 255)
+            # --- Matplotlib path (matches QuickLook) ---
+            fig, ax = plt.subplots(figsize=(1.6, 1.6), dpi=120)
+            if self._scale_mode == "Log10":
+                im = ax.imshow(np.clip(img_lin, eps, None), cmap=self._cmap,
+                            norm=LogNorm(vmin=max(eps, vmin), vmax=vmax))
+            else:
+                im = ax.imshow(img_lin, cmap=self._cmap, vmin=vmin, vmax=vmax)
+            ax.axis("off")
 
-            # colormap lookup
-            import matplotlib.cm as cm
-            lut = (cm.get_cmap(self._cmap)(np.linspace(0,1,256)) * 255.0).astype(np.uint8)
-            rgba = lut[idx]  # (H,W,4)
-            h, w = rgba.shape[:2]
-            qimg = QImage(rgba.data, w, h, 4*w, QImage.Format_RGBA8888).copy()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+            plt.close(fig)
+            qimg = QImage.fromData(buf.getvalue())
             pm = QPixmap.fromImage(qimg).scaledToWidth(140, Qt.SmoothTransformation)
             self._thumb_cache[key] = pm
 
         self._thumbs[el].setPixmap(pm)
 
+        # Thumbnail colorbar (use LINEAR vmin/vmax)
         if self._cbar_mode == "Thumbnails + zoom":
-            self._render_cbar(el, pm.height(), vmin, vmax)
+            self._render_cbar(el, pm.height(), vmin, vmax)  # pass LINEAR bounds
         else:
             self._cbars[el].setVisible(False)
 
@@ -597,7 +635,7 @@ class ElementImageSelectionDialog(QDialog):
         pm = self._cbar_base_cache.get(self._cmap)
         if pm is None:
             import matplotlib.cm as cm
-            lut = (cm.get_cmap(self._cmap)(np.linspace(0,1,256)) * 255.0).astype(np.uint8)
+            lut = (mpl.colormaps[self._cmap](np.linspace(0,1,256)) * 255.0).astype(np.uint8)
             rgba = np.ascontiguousarray(lut[::-1, :])
             qimg = QImage(rgba.data, 1, 256, 4*1, QImage.Format_RGBA8888).copy()
             pm = QPixmap.fromImage(qimg)
@@ -617,8 +655,8 @@ class ElementImageSelectionDialog(QDialog):
 
         # label values in linear domain
         if self._scale_mode == "Log10":
-            lo_val = 10.0 ** float(vmin) if vmin is not None else self._log_eps
-            hi_val = 10.0 ** float(vmax) if vmax is not None else self._log_eps
+            lo_val = 0.0 if vmin is None else float(vmin)
+            hi_val = 1.0 if vmax is None else float(vmax)
         else:
             lo_val = float(vmin) if vmin is not None else 0.0
             hi_val = float(vmax) if vmax is not None else 1.0
@@ -930,170 +968,6 @@ class ElementImageSelectionDialog(QDialog):
         else:
             QMessageBox.information(self, "Saved", f"Grid saved to:\n{path}")
 
-class QuickLookDialog(QDialog):
-    """
-    Zoomable, savable viewer with hover/click value readout.
-    - Wheel zoom, Right-click -> zoom out, Ctrl+0 -> reset
-    - 'Save PNG…' button renders a high-quality export (no blur)
-    - Hover shows (x,y) and value; left-click pins it
-    """
-    def __init__(self, element_name, img_linear, cmap, scale_mode, vmin, vmax, eps=1e-12, show_colorbar=True, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(element_name)
-        self.setAttribute(Qt.WA_DeleteOnClose, True)
-        self.resize(1000, 800)
-
-        self.img_linear = np.asarray(img_linear, dtype=float)  # (H,W)
-        self.cmap = cmap
-        self.scale_mode = scale_mode
-        self.vmin = float(vmin) if vmin is not None else None
-        self.vmax = float(vmax) if vmax is not None else None
-        self.eps  = float(eps)
-        self.show_cbar = bool(show_colorbar)
-
-        # Build display pixmap at native data resolution (1:1 mapping)
-        disp_arr = np.log10(np.clip(self.img_linear, self.eps, None)) if self.scale_mode == "Log10" else self.img_linear
-        if self.vmin is None or self.vmax is None or not np.isfinite([self.vmin, self.vmax]).all() or self.vmin == self.vmax:
-            self.vmin, self.vmax = float(np.nanmin(disp_arr)), float(np.nanmax(disp_arr))
-            if self.vmin == self.vmax:
-                self.vmin, self.vmax = 0.0, 1.0
-
-        # LUT map -> QImage
-        import matplotlib.cm as cm
-        lut = (cm.get_cmap(self.cmap)(np.linspace(0,1,256)) * 255.0).astype(np.uint8)
-        norm = (disp_arr - self.vmin) / (self.vmax - self.vmin + 1e-12)
-        idx = np.clip((norm * 255.0).round().astype(np.uint8), 0, 255)
-        rgba = lut[idx]  # (H,W,4)
-        H, W = rgba.shape[:2]
-        qimg = QImage(np.ascontiguousarray(rgba).data, W, H, 4*W, QImage.Format_RGBA8888).copy()
-        pm = QPixmap.fromImage(qimg)
-
-        # Optional colorbar (compose next to image)
-        if self.show_cbar:
-            bar = self._make_cbar_pixmap(H)
-            comp = QImage(W + 8 + bar.width(), H, QImage.Format_ARGB32)
-            comp.fill(Qt.white)
-            p = QPainter(comp)
-            p.drawPixmap(0, 0, pm)
-            p.drawPixmap(W + 8, 0, bar)
-            p.end()
-            pm = QPixmap.fromImage(comp)
-            self._img_rect = (0, 0, W, H)  # where the image sits in the composite
-        else:
-            self._img_rect = (0, 0, W, H)
-
-        # Scene/View
-        self.scene = QGraphicsScene(self)
-        self.pixitem = self.scene.addPixmap(pm)
-        self.view = _ZoomView(self.scene, self._value_from_pos, parent=self)
-        self.view.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-
-        # Top toolbar
-        tb = QToolBar()
-        act_save = QAction("Save PNG…", self); act_save.triggered.connect(self._save_png)
-        act_zoom_in = QAction("Zoom In (+)", self); act_zoom_in.triggered.connect(lambda: self.view.zoom(1.25))
-        act_zoom_out = QAction("Zoom Out (–)", self); act_zoom_out.triggered.connect(lambda: self.view.zoom(0.8))
-        act_reset = QAction("Reset (Ctrl+0)", self); act_reset.triggered.connect(self.view.reset_view)
-        tb.addAction(act_save); tb.addSeparator(); tb.addAction(act_zoom_in); tb.addAction(act_zoom_out); tb.addAction(act_reset)
-
-        # Status label (value readout)
-        self.status = QLabel("Move mouse over the image…")
-        self.status.setStyleSheet("color: #444;")
-
-        # Layout
-        lay = QVBoxLayout(self)
-        lay.addWidget(tb)
-        lay.addWidget(self.view, 1)
-        lay.addWidget(self.status)
-
-        # Fit initially
-        self.view.fitInView(self.pixitem, Qt.KeepAspectRatio)
-
-    # value callback used by the view
-    def _value_from_pos(self, scene_pos: QPointF):
-        x, y, W, H = self._img_rect
-        px = scene_pos.x() - x
-        py = scene_pos.y() - y
-        if px < 0 or py < 0 or px >= W or py >= H:
-            self.status.setText("—")
-            return None
-        ix = int(px)
-        iy = int(py)
-        # Clamp
-        H0, W0 = self.img_linear.shape
-        if ix >= W0 or iy >= H0:
-            self.status.setText("—")
-            return None
-        val = self.img_linear[iy, ix]
-        self.status.setText(f"x={ix}, y={iy}, value={val:.6g}")
-        return val
-
-    def _make_cbar_pixmap(self, height):
-        # Create labeled colorbar matching vmin/vmax, linear labels even for Log10
-        import matplotlib.cm as cm
-        lut = (cm.get_cmap(self.cmap)(np.linspace(0,1,256)) * 255.0).astype(np.uint8)
-        rgba = np.ascontiguousarray(lut[::-1, :])
-        base = QPixmap.fromImage(QImage(rgba.data, 1, 256, 4*1, QImage.Format_RGBA8888).copy())
-        bar = base.scaled(20, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-
-        # Label bar
-        total_w = 60
-        qimg = QImage(total_w, height, QImage.Format_ARGB32)
-        qimg.fill(Qt.white)
-        p = QPainter(qimg)
-        p.drawPixmap(total_w - bar.width(), 0, bar)
-
-        def _fmt(v):
-            if not np.isfinite(v) or v == 0: return "0"
-            e = int(np.floor(np.log10(abs(v))))
-            return f"{v:.0e}" if e >= 3 or e <= -3 else f"{v:.3g}"
-
-        if self.scale_mode == "Log10":
-            lo_val = 10.0 ** float(self.vmin)
-            hi_val = 10.0 ** float(self.vmax)
-        else:
-            lo_val, hi_val = float(self.vmin), float(self.vmax)
-
-        f = QFont(); f.setPointSize(9); p.setFont(f); p.setPen(Qt.black)
-        p.drawText(0, 0, total_w- bar.width() - 4, 16, Qt.AlignLeft | Qt.AlignTop, _fmt(hi_val))
-        p.drawText(0, height-16, total_w- bar.width() - 4, 16, Qt.AlignLeft | Qt.AlignBottom, _fmt(lo_val))
-        p.end()
-        return QPixmap.fromImage(qimg)
-
-    def _save_png(self):
-        fd = QFileDialog(self)
-        fd.setOption(QFileDialog.DontUseNativeDialog, True)
-        fd.setAcceptMode(QFileDialog.AcceptSave)
-        fd.setNameFilter("PNG Images (*.png)")
-        fd.selectFile(f"{self.windowTitle()}.png")
-        if fd.exec() != QFileDialog.Accepted:
-            return
-        path = fd.selectedFiles()[0]
-        if not path.lower().endswith(".png"):
-            path += ".png"
-
-        # Re-render at high quality (no UI chrome)
-        disp_arr = np.log10(np.clip(self.img_linear, self.eps, None)) if self.scale_mode == "Log10" else self.img_linear
-        import matplotlib.cm as cm
-        lut = (cm.get_cmap(self.cmap)(np.linspace(0,1,256)) * 255.0).astype(np.uint8)
-        norm = (disp_arr - self.vmin) / (self.vmax - self.vmin + 1e-12)
-        idx = np.clip((norm * 255.0).round().astype(np.uint8), 0, 255)
-        rgba = lut[idx]
-        H, W = rgba.shape[:2]
-        img = QImage(np.ascontiguousarray(rgba).data, W, H, 4*W, QImage.Format_RGBA8888).copy()
-
-        if self.show_colorbar:
-            bar = self._make_cbar_pixmap(H)
-            comp = QImage(W + 8 + bar.width(), H, QImage.Format_ARGB32)
-            comp.fill(Qt.white)
-            p = QPainter(comp)
-            p.drawImage(0, 0, img)
-            p.drawPixmap(W + 8, 0, bar)
-            p.end()
-            comp.save(path, "PNG")
-        else:
-            img.save(path, "PNG")
-
 class _ZoomView(QGraphicsView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1219,7 +1093,6 @@ class QuickLookDialog(QDialog):
         if path:
             pm.save(path, "PNG")
 
-
 def scale_features(df, scaler_type="standard"):
     if scaler_type == "minmax":
         scaler = MinMaxScaler()
@@ -1232,7 +1105,6 @@ def scale_features(df, scaler_type="standard"):
     scaled_df["X"] = df["X"].values
     scaled_df["Y"] = df["Y"].values
     return scaled_df
-
 
 def moran_filter(df_features, coordinates_df, threshold=None, parent=None):
     """
@@ -1392,4 +1264,1435 @@ def create_augmented_dataset(df, original_coords, element_scaler="standard", xy_
     )
     return df_aug
 
+class SpectraRoiDialog(QDialog):
+    """
+    Spectra & ROI with ONE global x-range (channel/energy span) and ONE global pixel ROI mask.
 
+    Spectra tab (one column, multiple rows):
+      • Each row overlays a chosen subset of clusters (keeps your cluster colors).
+      • Row settings via “Edit Row…” (clusters per row; Auto Y or manual Y).
+      • Global: Aggregate (mean/sum), Y-scale (linear/log), Show % in legend.
+      • LEFT-drag on any row or ROI-bottom spectra → set global span (per-row bands update).
+      • RIGHT-drag on any row / ROI-bottom spectra → zoom; RIGHT double-click → reset zoom.
+      • Save PNG, Export CSV/Excel.
+
+    ROI Imaging tab:
+      • Left: heatmap for ENABLED clusters; Right: heatmap for ALL clusters (reference).
+      • Rectangle ROI LEFT-drag on left heatmap: zooms both heatmaps, sets global pixel mask.
+      • Bottom: spectra of enabled clusters (shares global span; shows its own band).
+    """
+    spanChanged = Signal(tuple)   # (lo, hi)
+    maskChanged = Signal(object)  # bool mask
+
+    # ----------------------------- init -----------------------------
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlag(Qt.Window, True)
+        self.resize(1150, 820)
+        self.setMinimumSize(900, 720)
+        self.setSizeGripEnabled(True)
+
+        # ---- inputs ----
+        self.pcfg    = getattr(parent, "pipeline_config", {})
+        self.labels  = np.asarray(self.pcfg.get("clustering", {}).get("labels", []))
+        self.k       = int(self.pcfg.get("clustering", {}).get(
+                        "num_clusters", (int(self.labels.max())+1) if self.labels.size else 0))
+        self.xy      = self.pcfg.get("original_coordinates", None)
+        self.spectra = self.pcfg.get("raw_spectra", None)   # (N, C)
+        self.energy  = self.pcfg.get("energy_keV", None)    # (C,) optional
+
+        if self.labels.size == 0 or self.xy is None:
+            QMessageBox.critical(self, "Missing data", "Run loading & clustering first.")
+            self.reject(); return
+
+        # If spectra are missing (CSV-only path), use the same HDF dataset picker you use elsewhere.
+        if self.spectra is None:
+            if not self._ensure_spectra_loaded_from_hdf():
+                self.reject(); return
+
+        self.N, self.C = self.spectra.shape
+        self.current_roi_mask = np.ones(self.N, dtype=bool)   # global pixel mask
+        self._span_range = None                               # global x-span (lo, hi)
+        self._eps = 1e-12                                     # log floor
+        self._span_idx_range = None   # (i0, i1) in channel index space
+
+        # rows model: list of dicts: {"clusters": set[int], "ylim": None|(ymin,ymax)}
+        self.rows = [{"clusters": set(range(self.k)), "ylim": None}]
+
+        # per-row zoom + span bookkeeping
+        self._row_zoomers   = []      # RectangleSelector per row (RIGHT-drag)
+        self._row_defaults  = []      # (xlim_default, ylim_default) per row (for right-dblclick)
+        self._roi_zoom_sel  = None    # RIGHT-drag zoom on ROI spectra
+
+        # persistent bands: one per row + one on ROI spectra
+        self._row_span_patches   = [] # patch per row
+        self._roi_span_patch     = None
+
+        # span selectors (LEFT-drag). We keep them around but hide their visuals after each selection.
+        self._row_span_selectors = []
+        self._span_roi = None
+
+        # ---- tabs ----
+        tabs = QTabWidget(self)
+
+        # ===================== Spectra tab =====================
+        spec_tab = QWidget(); spec_v = QVBoxLayout(spec_tab)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Aggregate:"))
+        self.agg_combo = QComboBox(); self.agg_combo.addItems(["mean", "sum"])
+        top.addWidget(self.agg_combo)
+
+        top.addSpacing(12); top.addWidget(QLabel("Y-scale:"))
+        self.yscale = QComboBox(); self.yscale.addItems(["linear","log"]); self.yscale.setCurrentText("log")
+        top.addWidget(self.yscale)
+
+        top.addSpacing(12)
+        self.show_pct = QCheckBox("Show % in legend"); self.show_pct.setChecked(True)
+        top.addWidget(self.show_pct)
+
+        top.addStretch(1)
+        top.addWidget(QLabel("Row:"))
+        self.row_select = QComboBox(); self._refresh_row_select(); top.addWidget(self.row_select)
+
+        self.btn_edit_row  = QPushButton("Edit Row…")
+        self.btn_add_row   = QPushButton("Add row")
+        self.btn_remove    = QPushButton("Remove selected row")
+        self.btn_one_per   = QPushButton("One-per-cluster")
+        self.btn_clear     = QPushButton("Clear → 1 row (all)")
+        top.addWidget(self.btn_edit_row); top.addWidget(self.btn_add_row)
+        top.addWidget(self.btn_remove);   top.addWidget(self.btn_one_per); top.addWidget(self.btn_clear)
+
+        spec_v.addLayout(top)
+
+        self.spec_fig = Figure(figsize=(7.6, 5.6), constrained_layout=True)
+        self.spec_canvas = FigureCanvas(self.spec_fig)
+        self.spec_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        spec_v.addWidget(self.spec_canvas, 1)
+
+        span_row = QHBoxLayout()
+        self.span_info = QLabel("Selected range: (LEFT-drag on any row or ROI spectra)")
+        span_row.addWidget(self.span_info); span_row.addStretch(1)
+        self.btn_save_png  = QPushButton("Save PNG…")
+        self.btn_export    = QPushButton("Export spectra…")
+        span_row.addWidget(self.btn_save_png); span_row.addWidget(self.btn_export)
+        spec_v.addLayout(span_row)
+
+        tabs.addTab(spec_tab, "Spectra")
+
+        # ===================== ROI Imaging tab =====================
+        roi_tab = QWidget(); roi_v = QVBoxLayout(roi_tab)
+
+        cl_row = QHBoxLayout(); cl_row.addWidget(QLabel("Visible clusters (left & spectra):"))
+        self.cluster_checks = []
+        for cid in range(self.k):
+            cb = QCheckBox(f"{cid}"); cb.setChecked(True)
+            cb.stateChanged.connect(lambda *_: (self._update_heatmaps(),
+                                                self._render_roi_spectra(update_only=False),
+                                                self._update_all_row_span_overlays(),
+                                                ))
+            self.cluster_checks.append(cb); cl_row.addWidget(cb)
+        cl_row.addStretch(1)
+        roi_v.addLayout(cl_row)
+
+        self.roi_fig = Figure(figsize=(5.2, 4.6), constrained_layout=True)
+        self.roi_ax  = self.roi_fig.add_subplot(111)
+        self.roi_canvas = FigureCanvas(self.roi_fig)
+
+        self.map_fig = Figure(figsize=(5.2, 4.6), constrained_layout=True)
+        self.map_ax  = self.map_fig.add_subplot(111)
+        self.map_canvas = FigureCanvas(self.map_fig)
+
+        canv_row = QHBoxLayout()
+        canv_row.addWidget(self.roi_canvas, 1)
+        canv_row.addWidget(self.map_canvas, 1)
+        roi_v.addLayout(canv_row, 1)
+
+        tools = QHBoxLayout()
+        self.btn_rect        = QPushButton("Rectangle ROI")
+        self.btn_zoom_roi    = QPushButton("Zoom to ROI")
+        self.btn_reset_bars  = QPushButton("Reset ROI bars")
+        self.btn_clear_roi   = QPushButton("Clear ROI")
+
+        tools.addWidget(self.btn_rect)
+        tools.addWidget(self.btn_zoom_roi)
+        tools.addWidget(self.btn_reset_bars)
+        tools.addWidget(self.btn_clear_roi)
+        tools.addStretch(1)
+        roi_v.addLayout(tools)
+
+        self.roi_spec_fig = Figure(figsize=(9.0, 3.3), constrained_layout=True)
+        self.roi_spec_ax  = self.roi_spec_fig.add_subplot(111)
+        self.roi_spec_canvas = FigureCanvas(self.roi_spec_fig)
+        roi_v.addWidget(self.roi_spec_canvas, 0)
+
+        exp_row = QHBoxLayout()
+        self.btn_save_map   = QPushButton("Save heatmap PNG…")
+        self.btn_export_map = QPushButton("Export heatmap CSV…")
+        exp_row.addStretch(1); exp_row.addWidget(self.btn_save_map); exp_row.addWidget(self.btn_export_map)
+        roi_v.addLayout(exp_row)
+
+        tabs.addTab(roi_tab, "ROI Imaging")
+
+        lay = QVBoxLayout(self); lay.addWidget(tabs)
+
+        # optional hook for external color updates
+        if hasattr(parent, "cluster_colors_changed"):
+            try: parent.cluster_colors_changed.connect(self._on_colors_changed)
+            except Exception: pass
+
+        # wire actions
+        self.agg_combo.currentIndexChanged.connect(lambda *_: (self._render_spectra_rows(),
+                                                               self._render_roi_spectra(update_only=False)))
+        self.yscale.currentIndexChanged.connect(lambda *_: (self._render_spectra_rows(),
+                                                            self._render_roi_spectra(update_only=False)))
+        self.show_pct.stateChanged.connect(self._render_spectra_rows)
+
+        self.row_select.currentIndexChanged.connect(self._render_spectra_rows)
+        self.btn_edit_row.clicked.connect(self._edit_row_dialog)
+        self.btn_add_row.clicked.connect(self._add_row)
+        self.btn_remove.clicked.connect(self._remove_selected_row)
+        self.btn_one_per.clicked.connect(self._make_one_per_cluster)
+        self.btn_clear.clicked.connect(self._clear_to_one_row)
+
+        self.btn_save_png.clicked.connect(self._save_spectra_png)
+        self.btn_export.clicked.connect(self._export_spectra)
+
+        # existing
+        self.btn_rect.clicked.connect(self._activate_rectangle_roi)
+        self.btn_zoom_roi.clicked.connect(self._zoom_to_roi)
+        self.btn_reset_bars.clicked.connect(self._reset_roi_bars)
+        self.btn_clear_roi.clicked.connect(self._clear_roi)
+
+
+        self.btn_save_map.clicked.connect(self._save_heatmap_png)
+        self.btn_export_map.clicked.connect(self._export_heatmap_csv)
+
+        # sync span between tabs (and keep zoom)
+        self.spanChanged.connect(self._on_span_changed)
+
+        # RIGHT dbl-click reset hooks (rows + ROI spectra)
+        self._press_cid_spec = self.spec_canvas.mpl_connect("button_press_event", self._maybe_reset_row_zoom)
+        self._press_cid_roi  = self.roi_spec_canvas.mpl_connect("button_press_event", self._maybe_reset_roi_zoom)
+        self._press_cid_map1 = self.roi_canvas.mpl_connect("button_press_event", self._maybe_reset_map_zoom)
+        self._press_cid_map2 = self.map_canvas.mpl_connect("button_press_event", self._maybe_reset_map_zoom)
+
+        # ---- initial draws ----
+        self._cluster_rgba_img = self._build_cluster_image()
+        self._update_heatmaps()
+        self._render_roi_spectra(update_only=False)
+        self._render_spectra_rows()
+        self._init_span_selectors()
+        self._install_map_zooms()
+
+    # ---------------------- HDF loader (CSV-only path) ----------------------
+    def _ensure_spectra_loaded_from_hdf(self) -> bool:
+        """When only images.csv was loaded, ask for the HDF and let the user pick a dataset."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("HDF missing")
+        box.setText("This dataset has no raw spectra.\nImport the matching HDF5 now?")
+        import_btn = box.addButton("Import…", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is not import_btn:
+            return False
+
+        h5_path, _ = QFileDialog.getOpenFileName(self, "Select HDF5 file", "", "HDF5 Files (*.h5 *.hdf *.hdf5)")
+        if not h5_path:
+            return False
+
+        # Use the same dataset picker UI you use elsewhere (tree view)
+        picker = DatasetPickerDialog(h5_path, parent=self)
+        if picker.exec() != QDialog.Accepted:
+            return False
+        ds_path = picker.selected_path()
+        if not ds_path:
+            return False
+
+        # Read and sanity-check against XY
+        try:
+            with h5py.File(h5_path, "r") as f:
+                data = np.asarray(f[ds_path])
+                if data.ndim == 3:
+                    H, W, C = data.shape
+                    xs = self.xy["X"].astype(int).to_numpy()
+                    ys = self.xy["Y"].astype(int).to_numpy()
+                    if (H, W) != (int(ys.max())+1, int(xs.max())+1):
+                        QMessageBox.critical(self, "Size mismatch",
+                                             f"Dataset spatial size {H}×{W} does not match XY.")
+                        return False
+                    arr = data.reshape(H*W, C)
+                elif data.ndim == 2:
+                    arr = data
+                    if arr.shape[0] != len(self.xy):
+                        QMessageBox.critical(self, "Size mismatch",
+                                             f"Dataset length {arr.shape[0]} != number of pixels {len(self.xy)}.")
+                        return False
+                else:
+                    QMessageBox.critical(self, "Unsupported dataset", f"Shape {data.shape} not 2D/3D.")
+                    return False
+
+                self.spectra = arr.astype(float, copy=False)
+                self.N, self.C = self.spectra.shape
+
+                # best-effort energy axis from attrs
+                eng = None
+                ds = f[ds_path]
+                for key in ("energy", "energies", "xrf_energies", "energy_keV"):
+                    if key in ds.attrs:
+                        e = np.asarray(ds.attrs[key]).astype(float)
+                        eng = e/1000.0 if np.nanmax(e) > 5000 else e
+                        break
+                if eng is not None and eng.size == self.C:
+                    self.energy = eng
+
+            # persist back
+            self.pcfg["raw_spectra"] = self.spectra
+            if self.energy is not None:
+                self.pcfg["energy_keV"] = self.energy
+            return True
+
+        except Exception as e:
+            QMessageBox.critical(self, "Import error", str(e))
+            return False
+
+    # ----------------------------- helpers -----------------------------
+    def _x_axis(self):
+        if self.energy is not None and np.size(self.energy) == self.C:
+            return np.asarray(self.energy), "Energy (keV)", True
+        return np.arange(self.C), "Channels", False
+
+    def _get_cluster_colors(self):
+        rgba = (self.pcfg or {}).get("cluster_rgba", None)
+        if rgba is None:
+            cmap = mpl.colormaps["tab20"].resampled(max(1, self.k))
+            rgba = list(map(tuple, cmap.colors))
+        out = []
+        for c in rgba:
+            if len(c) == 3: r,g,b = c; a = 1.0
+            else: r,g,b,a = c[:4]
+            if max(r,g,b,a) > 1.01:
+                r,g,b,a = r/255.0, g/255.0, b/255.0, a/255.0
+            out.append((float(r), float(g), float(b), float(a)))
+        if len(out) < self.k:
+            out += [out[i % len(out)] for i in range(self.k - len(out))]
+        return out[:self.k]
+
+    def _on_colors_changed(self):
+        self._cluster_rgba_img = self._build_cluster_image()
+        self._render_spectra_rows(preserve_limits=True)
+        self._render_roi_spectra(update_only=False)
+        self._update_heatmaps()
+
+    def set_cluster_colors(self, rgba_list):
+        def _norm_one(c):
+            if len(c) == 3: r,g,b = c; a = 1.0
+            else: r,g,b,a = c[:4]
+            if max(r,g,b,a) > 1.01:
+                r,g,b,a = r/255.0, g/255.0, b/255.0, a/255.0
+            return float(r), float(g), float(b), float(a)
+        rgba = [_norm_one(c) for c in rgba_list]
+        if len(rgba) < self.k:
+            rgba += [rgba[i % len(rgba)] for i in range(self.k - len(rgba))]
+        self.pcfg["cluster_rgba"] = rgba[:self.k]
+        self._on_colors_changed()
+
+    def _refresh_row_select(self):
+        self.row_select.blockSignals(True)
+        self.row_select.clear()
+        for i in range(len(self.rows)):
+            self.row_select.addItem(f"Row {i+1}")
+        self.row_select.setCurrentIndex(0)
+        self.row_select.blockSignals(False)
+    
+    # --- SpanSelector cleanup helpers (remove red bars, keep gray band) ---
+    def _clear_selector_visuals(self, sel):
+        """Remove the selection artists drawn by a SpanSelector/RectangleSelector without disabling it."""
+        if sel is None:
+            return
+        # Matplotlib changed internals across versions, so try many names safely.
+        for attr in ("_selection_artist", "_rect", "_span", "_lineleft", "_lineright"):
+            art = getattr(sel, attr, None)
+            if art is not None:
+                try:
+                    art.remove()
+                except Exception:
+                    try:
+                        art.set_visible(False)
+                    except Exception:
+                        pass
+
+    def _clear_all_selector_visuals(self):
+        """Remove all currently visible red bars/rectangles from all selectors."""
+        for sel in getattr(self, "_row_span_selectors", []):
+            self._clear_selector_visuals(sel)
+        self._clear_selector_visuals(getattr(self, "_span_roi", None))
+        
+    # ---------------- Spectra drawing (per-row) ----------------
+    def _render_spectra_rows(self, preserve_limits: bool=False):
+        # save current limits if requested
+        prev_limits = []
+        if preserve_limits and self.spec_fig.axes:
+            for ax in self.spec_fig.axes:
+                prev_limits.append((ax.get_xlim(), ax.get_ylim()))
+        else:
+            prev_limits = None
+
+        # tear down old zoomers & span selectors (also delete their artists)
+        for z in self._row_zoomers:
+            try: z.disconnect_events()
+            except Exception: pass
+        self._row_zoomers = []
+
+        for s in self._row_span_selectors:
+            try:
+                self._clear_selector_visuals(s)  # <— NEW: remove the red bars
+                s.disconnect_events()
+            except Exception:
+                pass
+        self._row_span_selectors = []
+
+        self._row_defaults = []
+        self._row_span_patches = []
+
+        self.spec_fig.clear()
+        colors = self._get_cluster_colors()
+        x, xlabel, _ = self._x_axis()
+        agg    = self.agg_combo.currentText()
+        yscale = self.yscale.currentText()
+        pct    = self.pcfg.get("cluster_pct", {})
+        mask   = np.ones(self.N, dtype=bool)  # Spectra tab ignores rectangle ROI
+
+        nrows = max(1, len(self.rows))
+        axs = [self.spec_fig.add_subplot(nrows, 1, i+1) for i in range(nrows)]
+
+        for r, ax in enumerate(axs):
+            for cid in sorted(self.rows[r]["clusters"]):
+                idx = (self.labels == cid) & mask
+                if not np.any(idx):
+                    continue
+                Y = self.spectra[idx]
+                y = np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)
+                if yscale == "log": y = np.where(y <= 0, self._eps, y)
+                label = f"Cluster {cid}"
+                if self.show_pct.isChecked(): label += f"  {pct.get(int(cid), 0.0):.1f}%"
+                ax.plot(x, y, color=colors[cid], lw=1.2, label=label)
+
+            ax.set_ylabel("Intensity" if agg == "mean" else "Counts (sum)")
+            ax.grid(True, which=("both" if yscale == "log" else "major"), alpha=0.25)
+            ax.set_yscale(yscale)
+            if r == nrows - 1: ax.set_xlabel(xlabel)
+
+            # force x edges to exactly data edges
+            ax.set_xlim(float(x.min()), float(x.max()))
+
+            # manual Y or autorange, store defaults
+            ylim = self.rows[r].get("ylim")
+            if isinstance(ylim, tuple) and ylim is not None:
+                ymin, ymax = ylim
+                if yscale == "log":
+                    ymin = max(self._eps, ymin)
+                    ymax = max(ymin * 1.001, ymax)
+                ax.set_ylim(ymin, ymax)
+            else:
+                ax.relim(); ax.autoscale_view()
+
+            self._row_defaults.append(((float(x.min()), float(x.max())), ax.get_ylim()))
+
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc="best", fontsize=8)
+
+            # persistent band for this axes
+            self._row_span_patches.append(self._ensure_row_span_patch(ax))
+
+        # reapply previous limits if needed
+        if preserve_limits and prev_limits and len(prev_limits) == len(axs):
+            for ax, (xl, yl) in zip(axs, prev_limits):
+                ax.set_xlim(*xl)
+                r = self.spec_fig.axes.index(ax)
+                row_yl = self.rows[r].get("ylim")
+                if isinstance(row_yl, tuple) and row_yl is not None:
+                    ax.set_ylim(*row_yl)
+                else:
+                    ax.set_ylim(*yl)
+
+        self.spec_canvas.draw_idle()
+        self._update_span_label()
+
+        # RIGHT-drag zoom for each axes
+        for r, ax in enumerate(axs):
+            self._row_zoomers.append(
+                RectangleSelector(
+                    ax, lambda e0, e1, rr=r: self._on_row_zoom(rr, e0, e1),
+                    useblit=True, button=[MouseButton.RIGHT],
+                    minspanx=5, minspany=5, spancoords="data",
+                    interactive=False, drag_from_anywhere=False
+                )
+            )
+
+        # LEFT-drag span selectors for each row (non-interactive; we hide the visual right after)
+        for ax in axs:
+            sel = SpanSelector(
+                ax, lambda a,b, s=None: self._on_span_select(a, b, ax_selector=sel),
+                "horizontal", useblit=True, props=dict(alpha=0.15),
+                interactive=False, grab_range=5,
+                button=[MouseButton.LEFT], ignore_event_outside=False
+            )
+            self._row_span_selectors.append(sel)
+            
+    def _span_lohi_in_axis_units(self):
+        """
+        Return (lo, hi) for the current x-axis units (energy or channels),
+        computed from the canonical index range if available.
+        """
+        # If you've already got this helper in your class, keep a single copy.
+        if getattr(self, "_span_idx_range", None) is None:
+            # Fallback for older projects: use raw values (already in current units)
+            return getattr(self, "_span_range", None)
+        x, _, _ = self._x_axis()
+        i0, i1 = self._span_idx_range
+        i0 = max(0, min(self.C - 1, int(i0)))
+        i1 = max(0, min(self.C - 1, int(i1)))
+        lo = float(x[min(i0, i1)])
+        hi = float(x[max(i0, i1)])
+        return (lo, hi)
+
+    # persist band on a given axes
+    def _ensure_row_span_patch(self, ax):
+        lohi = self._span_lohi_in_axis_units()
+        if lohi is None:
+            if getattr(ax, "_roi_span_patch", None):
+                try: ax._roi_span_patch.remove()
+                except Exception: pass
+                ax._roi_span_patch = None
+            return None
+
+        lo, hi = lohi
+        p = getattr(ax, "_roi_span_patch", None)
+        if p is None:
+            ax._roi_span_patch = ax.axvspan(
+                lo, hi, ymin=0.0, ymax=1.0,
+                transform=ax.get_xaxis_transform(),
+                color="k", alpha=0.08, zorder=0
+            )
+            return ax._roi_span_patch
+
+        try:
+            p.set_xy([[lo, 0.0], [lo, 1.0], [hi, 1.0], [hi, 0.0], [lo, 0.0]])
+            return p
+        except Exception:
+            pass
+        try:
+            if hasattr(p, "set_x") and hasattr(p, "set_width"):
+                p.set_x(lo); p.set_width(hi - lo)
+                return p
+        except Exception:
+            pass
+
+        try: p.remove()
+        except Exception: pass
+        ax._roi_span_patch = ax.axvspan(
+            lo, hi, ymin=0.0, ymax=1.0,
+            transform=ax.get_xaxis_transform(),
+            color="k", alpha=0.08, zorder=0
+        )
+        return ax._roi_span_patch
+
+    def _update_all_row_span_overlays(self):
+        for ax in self.spec_fig.axes:
+            self._ensure_row_span_patch(ax)
+        self._ensure_roi_span_patch()
+        self.spec_canvas.draw_idle()
+        self.roi_spec_canvas.draw_idle()
+
+    # RIGHT dbl-click reset (rows)
+    def _maybe_reset_row_zoom(self, event):
+        if event is None or event.inaxes is None:
+            return
+        if event.dblclick and event.button == MouseButton.RIGHT and event.inaxes in self.spec_fig.axes:
+            ax = event.inaxes
+            r = self.spec_fig.axes.index(ax)
+            xlim_def, ylim_def = self._row_defaults[r] if r < len(self._row_defaults) else (ax.get_xlim(), ax.get_ylim())
+            ax.set_xlim(*xlim_def)
+            ylim = self.rows[r].get("ylim")
+            if isinstance(ylim, tuple) and ylim is not None:
+                ax.set_ylim(*ylim)
+            else:
+                ax.set_ylim(*ylim_def)
+            self.spec_canvas.draw_idle()
+
+    def _on_row_zoom(self, r, e0, e1):
+        if r < 0 or r >= len(self.spec_fig.axes) or e0 is None or e1 is None:
+            return
+        ax = self.spec_fig.axes[r]
+        if e0.xdata is None or e1.xdata is None or e0.ydata is None or e1.ydata is None:
+            return
+        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
+        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
+        if x0 == x1:
+            xr = ax.get_xlim(); pad = max(1e-9, 0.02*(xr[1]-xr[0])); x0, x1 = (x0 - pad, x1 + pad)
+        if y0 == y1:
+            yr = ax.get_ylim(); pad = max(1e-12, 0.02*abs(yr[1]-yr[0])); y0, y1 = (y0 - pad, y1 + pad)
+        if self.yscale.currentText() == "log":
+            y0 = max(self._eps, y0); y1 = max(y0*1.001, y1)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        self.spec_canvas.draw_idle()
+
+    # ---------------- Row editing ----------------
+    def _add_row(self):
+        base = set(self.rows[0]["clusters"]) if self.rows else set(range(self.k))
+        self.rows.append({"clusters": base, "ylim": None})
+        self._refresh_row_select()
+        self._render_spectra_rows(preserve_limits=True)
+
+    def _remove_selected_row(self):
+        r = self.row_select.currentIndex()
+        if len(self.rows) <= 1:
+            QMessageBox.information(self, "Remove row", "Keep at least one row.")
+            return
+        if 0 <= r < len(self.rows):
+            self.rows.pop(r)
+            self._refresh_row_select()
+            self._render_spectra_rows(preserve_limits=True)
+
+    def _clear_to_one_row(self):
+        self.rows = [{"clusters": set(range(self.k)), "ylim": None}]
+        self._refresh_row_select()
+        self._render_spectra_rows(preserve_limits=False)
+
+    def _auto_limits_for_row(self, r):
+        agg    = self.agg_combo.currentText()
+        yscale = self.yscale.currentText()
+        mask = np.ones(self.N, dtype=bool)  # Spectra tab ignores rectangle ROI
+        ymin, ymax = np.inf, -np.inf
+        for cid in self.rows[r]["clusters"]:
+            idx = (self.labels == cid) & mask
+            if not np.any(idx): continue
+            Y = self.spectra[idx]
+            y = np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)
+            if yscale == "log": y = np.where(y <= 0, self._eps, y)
+            ymin = min(ymin, float(np.nanmin(y)))
+            ymax = max(ymax, float(np.nanmax(y)))
+        if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
+            ymin, ymax = (self._eps if yscale=="log" else 0.0, 1.0)
+        if yscale == "log":
+            ymin = max(self._eps, ymin)
+            ymax = max(ymin*1.001, ymax)
+        return ymin, ymax
+
+    def _edit_row_dialog(self):
+        r = self.row_select.currentIndex()
+        if not (0 <= r < len(self.rows)): return
+
+        dlg = QDialog(self); dlg.setWindowTitle(f"Edit Row {r+1}")
+        v = QVBoxLayout(dlg)
+
+        grid = QGridLayout(); ncol = 6
+        checks = []
+        for i in range(self.k):
+            cb = QCheckBox(f"Cluster {i}")
+            cb.setChecked(i in self.rows[r]["clusters"])
+            grid.addWidget(cb, i // ncol, i % ncol)
+            checks.append((i, cb))
+        v.addLayout(grid)
+
+        yl = QHBoxLayout()
+        auto_box = QCheckBox("Auto Y"); yl.addWidget(auto_box)
+        ymin_spin = QDoubleSpinBox(); ymax_spin = QDoubleSpinBox()
+        ymin_spin.setDecimals(6); ymax_spin.setDecimals(6)
+        ymin_spin.setRange(-1e30, 1e30); ymax_spin.setRange(-1e30, 1e30)
+        yl.addSpacing(12); yl.addWidget(QLabel("Ymin:")); yl.addWidget(ymin_spin)
+        yl.addSpacing(8);  yl.addWidget(QLabel("Ymax:")); yl.addWidget(ymax_spin)
+        v.addLayout(yl)
+
+        if self.rows[r]["ylim"] is None:
+            y0, y1 = self._auto_limits_for_row(r)
+            auto_box.setChecked(True)
+            ymin_spin.setValue(y0); ymax_spin.setValue(y1)
+            ymin_spin.setEnabled(False); ymax_spin.setEnabled(False)
+        else:
+            y0, y1 = self.rows[r]["ylim"]
+            auto_box.setChecked(False)
+            ymin_spin.setValue(float(y0)); ymax_spin.setValue(float(y1))
+            ymin_spin.setEnabled(True);  ymax_spin.setEnabled(True)
+
+        def _toggle_auto(state):
+            use_auto = (state == Qt.Checked)
+            if use_auto:
+                y0, y1 = self._auto_limits_for_row(r)
+                ymin_spin.setValue(y0); ymax_spin.setValue(y1)
+            ymin_spin.setEnabled(not use_auto); ymax_spin.setEnabled(not use_auto)
+        auto_box.stateChanged.connect(_toggle_auto)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(btns)
+
+        def _apply():
+            cl = {i for i, cb in checks if cb.isChecked()}
+            self.rows[r]["clusters"] = cl
+            if auto_box.isChecked():
+                self.rows[r]["ylim"] = None
+            else:
+                y0, y1 = float(ymin_spin.value()), float(ymax_spin.value())
+                self.rows[r]["ylim"] = (y0, y1)
+            dlg.accept()
+            self._render_spectra_rows(preserve_limits=True)
+
+        btns.accepted.connect(_apply)
+        btns.rejected.connect(dlg.reject)
+        dlg.exec()
+
+    # ---------------- span selectors ----------------
+    def _init_span_selectors(self):
+        # Kill previous ROI selector artists (red bars) but keep it active
+        if hasattr(self, "_span_roi") and self._span_roi is not None:
+            try:
+                self._clear_selector_visuals(self._span_roi)
+                self._span_roi.disconnect_events()
+            except Exception:
+                pass
+            self._span_roi = None
+
+        # Kill row selectors & their artists
+        for s in getattr(self, "_row_span_selectors", []):
+            try:
+                self._clear_selector_visuals(s)
+                s.disconnect_events()
+            except Exception:
+                pass
+        self._row_span_selectors = []
+
+        # Install LEFT-drag span selectors on every spectra row
+        for ax in self.spec_fig.axes:
+            sel = SpanSelector(
+                ax, lambda a, b: self._set_span(min(a, b), max(a, b)),
+                "horizontal", useblit=True, props=dict(alpha=0.15),
+                interactive=True, grab_range=5,
+                button=[MouseButton.LEFT], ignore_event_outside=False
+            )
+            self._row_span_selectors.append(sel)
+
+        # ROI tab bottom spectra (LEFT-drag)
+        self._span_roi = SpanSelector(
+            self.roi_spec_ax, lambda a, b: self._set_span(min(a, b), max(a, b)),
+            "horizontal", useblit=True, props=dict(alpha=0.15),
+            interactive=True, grab_range=5,
+            button=[MouseButton.LEFT], ignore_event_outside=False
+        )
+
+        # ROI spectra RIGHT-drag zoomer
+        if self._roi_zoom_sel is not None:
+            try: self._roi_zoom_sel.disconnect_events()
+            except Exception: pass
+        self._roi_zoom_sel = RectangleSelector(
+            self.roi_spec_ax, self._on_roi_zoom,
+            useblit=True, button=[MouseButton.RIGHT],
+            minspanx=5, minspany=5, spancoords="data",
+            interactive=False, drag_from_anywhere=False
+        )
+
+    def _hide_selector_visual(self, selector):
+        """Hide the transient red handles/rectangle drawn by a SpanSelector."""
+        try:
+            selector.set_visible(False)
+        except Exception:
+            pass
+
+    def _on_span_select(self, a, b, ax_selector=None):
+        lo, hi = float(min(a, b)), float(max(a, b))
+        self._set_span(lo, hi)
+        if ax_selector is not None:
+            self._hide_selector_visual(ax_selector)  # remove the red handles immediately
+        # patches get updated via spanChanged → _on_span_changed
+
+    def _set_span(self, lo, hi, source="any"):
+        # Always keep the original values around (for backwards compat/UI), but
+        # canonically persist the selection in INDEX space.
+        self._span_range = (float(lo), float(hi))
+
+        # Compute index bounds under current axis mapping
+        x, _, is_energy = self._x_axis()
+        if is_energy:
+            # map energy → nearest channel indices
+            i0 = int(np.argmin(np.abs(x - float(lo))))
+            i1 = int(np.argmin(np.abs(x - float(hi))))
+        else:
+            i0 = int(np.floor(min(lo, hi)))
+            i1 = int(np.ceil (max(lo, hi)))
+
+        i0 = max(0, min(self.C - 1, i0))
+        i1 = max(0, min(self.C - 1, i1))
+        self._span_idx_range = (min(i0, i1), max(i0, i1))
+
+        # Hide transient selector visuals so only the persistent grey band remains
+        self._clear_all_selector_visuals()
+        self.spanChanged.emit(self._span_range)
+
+    def _on_span_changed(self, span):
+        self._span_range = (float(span[0]), float(span[1]))
+        self._refresh_span_bands()
+
+    def _refresh_span_bands(self):
+        self._update_span_label()
+        self._update_heatmaps()
+        self._render_roi_spectra(update_only=True)
+        self._update_all_row_span_overlays()
+        # also ensure any transient selector visuals are hidden
+        for s in self._row_span_selectors:
+            self._hide_selector_visual(s)
+        if self._span_roi is not None:
+            self._hide_selector_visual(self._span_roi)
+
+    def _update_span_label(self):
+        if self._span_idx_range is None and self._span_range is None:
+            self.span_info.setText("Selected range: (LEFT-drag on any row or ROI spectra)")
+            return
+        x, _, is_energy = self._x_axis()
+
+        if self._span_idx_range is not None:
+            i0, i1 = self._span_idx_range
+            i0 = max(0, min(self.C - 1, int(i0)))
+            i1 = max(0, min(self.C - 1, int(i1)))
+            lo = float(x[min(i0, i1)])
+            hi = float(x[max(i0, i1)])
+        else:
+            # fallback for old sessions
+            lo, hi = self._span_range
+            lo = max(float(x.min()), min(float(x.max()), lo))
+            hi = max(float(x.min()), min(float(x.max()), hi))
+
+        if is_energy:
+            self.span_info.setText(f"Selected range: {lo:.4g} – {hi:.4g} keV")
+        else:
+            self.span_info.setText(f"Selected range: {int(round(lo))} – {int(round(hi))} channels")
+
+    # ---------------- ROI (rectangle + heatmaps + spectra) ----------------
+    def _build_cluster_image(self):
+        xs = self.xy["X"].astype(int).to_numpy()
+        ys = self.xy["Y"].astype(int).to_numpy()
+        W = int(xs.max()) + 1; H = int(ys.max()) + 1
+        rgba = self._get_cluster_colors()
+        img = np.ones((H, W, 4), dtype=float); img[..., 3] = 0.0
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            lbl = int(self.labels[i])
+            if 0 <= x < W and 0 <= y < H:
+                img[y, x] = rgba[lbl]
+        return img
+
+    def _heatmap_array(self, keep_clusters=None):
+        idx_cols = self._current_span_indices()
+        xs = self.xy["X"].astype(int).to_numpy()
+        ys = self.xy["Y"].astype(int).to_numpy()
+        W = int(xs.max()) + 1; H = int(ys.max()) + 1
+        img = np.zeros((H, W), dtype=float)
+
+        if keep_clusters is None:
+            mask = np.ones(self.N, dtype=bool)
+        else:
+            mask = np.isin(self.labels, list(keep_clusters))
+
+        if np.any(mask):
+            vals = self.spectra[mask][:, idx_cols].sum(axis=1)
+            img[ys[mask], xs[mask]] = vals
+        return img
+
+    def _apply_zoom_to_maps(self, redraw=True):
+        H, W, _ = self._cluster_rgba_img.shape
+        for ax in (self.roi_ax, self.map_ax):
+            for p in list(ax.patches):
+                p.remove()
+
+        if hasattr(self, "_last_rect"):
+            x0, y0, x1, y1 = self._last_rect
+            for ax in (self.roi_ax, self.map_ax):
+                ax.set_xlim(x0, x1)
+                ax.set_ylim(y1, y0)  # imshow origin='upper'
+                ax.add_patch(mpl.patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.4))
+        else:
+            for ax in (self.roi_ax, self.map_ax):
+                ax.set_xlim(0, W - 1)
+                ax.set_ylim(H - 1, 0)
+
+        if redraw:
+            self.roi_canvas.draw_idle()
+            self.map_canvas.draw_idle()
+
+    def _update_roi_overlays(self, clear_only: bool = False):
+        """Draw/clear ROI overlays (focus rect + hatched dimming outside)."""
+        # track and remove previous overlays safely
+        for attr in ("_roi_overlay_left", "_roi_overlay_right"):
+            patches = getattr(self, attr, [])
+            for p in patches:
+                try: p.remove()
+                except Exception: pass
+            setattr(self, attr, [])
+
+        if clear_only or not hasattr(self, "_last_rect"):
+            # nothing else to draw
+            if hasattr(self, "roi_canvas"): self.roi_canvas.draw_idle()
+            if hasattr(self, "map_canvas"): self.map_canvas.draw_idle()
+            return
+
+        x0, y0, x1, y1 = self._last_rect
+        H, W, _ = self._cluster_rgba_img.shape
+
+        def _draw(ax):
+            drawn = []
+            # focus rectangle (thin white outline)
+            try:
+                r = mpl.patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.6, ec="w")
+                ax.add_patch(r); drawn.append(r)
+            except Exception:
+                pass
+            # four “outside” rectangles with a light hatch + translucent fill
+            try:
+                hatch = "////"
+                fc = (0, 0, 0, 0.06)  # subtle dim
+                ec = (0, 0, 0, 0.15)
+                # left
+                if x0 > 0:
+                    p = mpl.patches.Rectangle((0, 0), x0, H, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+                # right
+                if x1 < W:
+                    p = mpl.patches.Rectangle((x1, 0), W - x1, H, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+                # top
+                if y0 > 0:
+                    p = mpl.patches.Rectangle((x0, 0), x1 - x0, y0, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+                # bottom
+                if y1 < H:
+                    p = mpl.patches.Rectangle((x0, y1), x1 - x0, H - y1, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+            except Exception:
+                pass
+            return drawn
+
+        self._roi_overlay_left  = _draw(self.roi_ax)
+        self._roi_overlay_right = _draw(self.map_ax)
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+
+    def _install_map_zooms(self):
+        """Right-drag zoom on both heatmaps."""
+        # disconnect previous
+        for attr in ("_map_zoom_left", "_map_zoom_right"):
+            sel = getattr(self, attr, None)
+            if sel is not None:
+                try: sel.disconnect_events()
+                except Exception: pass
+                setattr(self, attr, None)
+
+        self._map_zoom_left = RectangleSelector(
+            self.roi_ax, lambda e0, e1, ax=self.roi_ax: self._on_map_zoom(ax, e0, e1),
+            useblit=True, button=[MouseButton.RIGHT],
+            minspanx=5, minspany=5, spancoords="data",
+            interactive=False, drag_from_anywhere=False
+        )
+        self._map_zoom_right = RectangleSelector(
+            self.map_ax, lambda e0, e1, ax=self.map_ax: self._on_map_zoom(ax, e0, e1),
+            useblit=True, button=[MouseButton.RIGHT],
+            minspanx=5, minspany=5, spancoords="data",
+            interactive=False, drag_from_anywhere=False
+        )
+
+    def _on_map_zoom(self, ax, e0, e1):
+        """Right-drag rectangle zoom: apply to BOTH heatmaps (origin='upper')."""
+        if e0 is None or e1 is None: 
+            return
+        if None in (e0.xdata, e1.xdata, e0.ydata, e1.ydata):
+            return
+
+        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
+        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
+
+        # pad degenerate selections
+        def _pad_if_needed(ax_, x0_, x1_, y0_, y1_):
+            if x0_ == x1_:
+                xr = ax_.get_xlim(); pad = max(1e-9, 0.02*(xr[1]-xr[0])); x0_, x1_ = (x0_ - pad, x1_ + pad)
+            if y0_ == y1_:
+                yr = ax_.get_ylim(); pad = max(1e-9, 0.02*abs(yr[1]-yr[0])); y0_, y1_ = (y0_ - pad, y1_ + pad)
+            return x0_, x1_, y0_, y1_
+
+        x0, x1, y0, y1 = _pad_if_needed(ax, x0, x1, y0, y1)
+
+        # Apply to BOTH heatmaps; y is inverted for imshow(origin='upper')
+        for target_ax in (self.roi_ax, self.map_ax):
+            target_ax.set_xlim(x0, x1)
+            target_ax.set_ylim(y1, y0)
+
+        self.roi_canvas.draw_idle()
+        self.map_canvas.draw_idle()
+
+    def _maybe_reset_map_zoom(self, event):
+        """Double-right-click on either heatmap resets BOTH to default extents."""
+        if event is None or event.inaxes is None:
+            return
+        if not (getattr(event, "dblclick", False) and event.button == MouseButton.RIGHT):
+            return
+        if event.inaxes not in (self.roi_ax, self.map_ax):
+            return
+
+        # Defaults are stored on each draw; compute if missing
+        if not hasattr(self, "_map_default_xlim") or not hasattr(self, "_map_default_ylim"):
+            H, W, _ = self._cluster_rgba_img.shape
+            self._map_default_xlim = (0, W - 1)
+            self._map_default_ylim = (H - 1, 0)
+
+        for target_ax in (self.roi_ax, self.map_ax):
+            target_ax.set_xlim(*self._map_default_xlim)
+            target_ax.set_ylim(*self._map_default_ylim)
+
+        self.roi_canvas.draw_idle()
+        self.map_canvas.draw_idle()
+
+    def _update_heatmaps(self):
+        keep = {i for i, cb in enumerate(self.cluster_checks) if cb.isChecked()}
+        img_focus  = self._heatmap_array(keep_clusters=keep)
+        img_global = self._heatmap_array(keep_clusters=None)
+
+        self.roi_ax.clear()
+        im1 = self.roi_ax.imshow(img_focus, cmap="inferno")
+        self.roi_ax.set_title("Heatmap (enabled clusters)"); self.roi_ax.axis("off")
+
+        self.map_ax.clear()
+        im2 = self.map_ax.imshow(img_global, cmap="inferno")
+        self.map_ax.set_title("Heatmap (all clusters)"); self.map_ax.axis("off")
+
+        for attr in ("_focus_cbar", "_global_cbar"):
+            if hasattr(self, attr) and getattr(self, attr):
+                try: getattr(self, attr).remove()
+                except Exception: pass
+                setattr(self, attr, None)
+
+        self._focus_cbar  = self.roi_fig.colorbar(im1, ax=self.roi_ax, fraction=0.046, pad=0.03)
+        self._global_cbar = self.map_fig.colorbar(im2, ax=self.map_ax, fraction=0.046, pad=0.03)
+
+        # self._apply_zoom_to_maps(redraw=False)
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+        # --- NEW: remember default extents for heatmap unzoom ---
+        H, W, _ = self._cluster_rgba_img.shape
+        self._map_default_xlim = (0, W - 1)
+        self._map_default_ylim = (H - 1, 0)  # origin='upper'
+
+        # --- NEW: re-apply ROI overlays after clearing axes ---
+        self._update_roi_overlays()
+
+    def _activate_rectangle_roi(self):
+        try:
+            if hasattr(self, "_rect_sel") and self._rect_sel is not None:
+                self._rect_sel.set_visible(False); self._rect_sel.disconnect_events()
+        except Exception:
+            pass
+
+        def _on_select(eclick, erelease):
+            if eclick is None or erelease is None: return
+            if None in (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata): return
+            x0 = int(np.floor(min(eclick.xdata, erelease.xdata)))
+            x1 = int(np.ceil (max(eclick.xdata, erelease.xdata)))
+            y0 = int(np.floor(min(eclick.ydata, erelease.ydata)))
+            y1 = int(np.ceil (max(eclick.ydata, erelease.ydata)))
+            self._last_rect = (x0, y0, x1, y1)
+
+            xs = self.xy["X"].to_numpy(); ys = self.xy["Y"].to_numpy()
+            in_rect = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+            self.current_roi_mask = in_rect
+
+            # Do NOT zoom; just update overlays + spectra/rows
+            self._update_roi_overlays()
+            self._render_roi_spectra(update_only=False)
+            # self._render_spectra_rows(preserve_limits=True)
+
+        self._rect_sel = RectangleSelector(
+            self.roi_ax, _on_select,
+            useblit=True, button=[MouseButton.LEFT],
+            minspanx=2, minspany=2, spancoords="pixels",
+            interactive=False, drag_from_anywhere=False,
+        )
+
+    def _clear_roi(self):
+        """Clear the pixel ROI + focus overlays and UNZOOM the heatmaps to defaults.
+        Does NOT touch the ROI channel 'shadow' bands."""
+        self.current_roi_mask = np.ones(self.N, dtype=bool)
+        if hasattr(self, "_last_rect"):
+            delattr(self, "_last_rect")
+
+        self._clear_all_selector_visuals()
+        self._update_roi_overlays(clear_only=True)
+
+        self._update_heatmaps()
+
+        if not hasattr(self, "_map_default_xlim") or not hasattr(self, "_map_default_ylim"):
+            H, W, _ = self._cluster_rgba_img.shape
+            self._map_default_xlim = (0, W - 1)
+            self._map_default_ylim = (H - 1, 0)
+        for ax in (self.roi_ax, self.map_ax):
+            ax.set_xlim(*self._map_default_xlim)
+            ax.set_ylim(*self._map_default_ylim)
+        self.roi_canvas.draw_idle()
+        self.map_canvas.draw_idle()
+
+        self._render_roi_spectra(update_only=False)
+        self._update_all_row_span_overlays()
+
+    def _current_span_indices(self):
+        # Use canonical index range if available
+        if self._span_idx_range is not None:
+            i0, i1 = self._span_idx_range
+            i0 = max(0, min(self.C - 1, int(i0)))
+            i1 = max(0, min(self.C - 1, int(i1)))
+            lo, hi = (min(i0, i1), max(i0, i1))
+            return np.arange(lo, hi + 1)
+
+        # Fallback to old behavior if no index span is stored yet
+        x, _, is_energy = self._x_axis()
+        if self._span_range is None:
+            return np.arange(self.C)
+        lo, hi = self._span_range
+        if is_energy:
+            return np.where((x >= lo) & (x <= hi))[0]
+        a = int(np.floor(min(lo, hi))); b = int(np.ceil(max(lo, hi)))
+        a = max(0, min(self.C - 1, a)); b = max(0, min(self.C - 1, b))
+        return np.arange(min(a, b), max(a, b) + 1)
+
+    # ---------------- ROI bottom spectra ----------------
+    def _ensure_roi_span_patch(self):
+        """
+        Ensure the persistent gray band on the ROI-spectra (bottom) axis matches
+        the current span, recreating it if the axes were cleared or changed.
+        """
+        ax = self.roi_spec_ax
+        lohi = self._span_lohi_in_axis_units()
+        if lohi is None:
+            # No span selected: remove any stale patch
+            p = getattr(self, "_roi_span_patch", None)
+            if p is not None:
+                try: p.remove()
+                except Exception: pass
+            self._roi_span_patch = None
+            return None
+
+        lo, hi = lohi
+        p = getattr(self, "_roi_span_patch", None)
+
+        # If we don't have a patch yet, or the old patch was detached by ax.clear(),
+        # recreate a fresh one.
+        if (p is None) or (getattr(p, "axes", None) is not ax) or (p not in ax.patches):
+            self._roi_span_patch = ax.axvspan(
+                lo, hi, ymin=0.0, ymax=1.0,
+                transform=ax.get_xaxis_transform(),
+                color="k", alpha=0.08, zorder=0
+            )
+            return self._roi_span_patch
+
+        # Try to update in place
+        try:
+            p.set_xy([[lo, 0.0], [lo, 1.0], [hi, 1.0], [hi, 0.0], [lo, 0.0]])
+            return p
+        except Exception:
+            pass
+        try:
+            if hasattr(p, "set_x") and hasattr(p, "set_width"):
+                p.set_x(lo); p.set_width(hi - lo)
+                return p
+        except Exception:
+            pass
+
+        # Fallback: recreate
+        try: p.remove()
+        except Exception: pass
+        self._roi_span_patch = ax.axvspan(
+            lo, hi, ymin=0.0, ymax=1.0,
+            transform=ax.get_xaxis_transform(),
+            color="k", alpha=0.08, zorder=0
+        )
+        return self._roi_span_patch
+
+    def _render_roi_spectra(self, update_only=False):
+        """
+        Draw (or update) the spectra at the bottom of the ROI tab. If we clear the
+        axes, we invalidate the stored patch so it will be recreated on this axes.
+        """
+        if not update_only:
+            self.roi_spec_ax.clear()
+            # IMPORTANT: invalidate the old patch because ax.clear() detached it.
+            self._roi_span_patch = None
+
+        colors = self._get_cluster_colors()
+        x, xlabel, _ = self._x_axis()
+        agg    = self.agg_combo.currentText()
+        yscale = self.yscale.currentText()
+        mask   = self.current_roi_mask
+        keep = {i for i, cb in enumerate(self.cluster_checks) if cb.isChecked()}
+
+        if not update_only:
+            for cid in sorted(keep):
+                idx = (self.labels == cid) & mask
+                if not np.any(idx): 
+                    continue
+                Y = self.spectra[idx]
+                y = np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)
+                if yscale == "log": 
+                    y = np.where(y <= 0, self._eps, y)
+                self.roi_spec_ax.plot(x, y, color=colors[cid], lw=1.1, label=f"Cluster {cid}")
+            self.roi_spec_ax.set_xlabel(xlabel)
+            self.roi_spec_ax.set_ylabel("Intensity" if agg == "mean" else "Counts (sum)")
+            self.roi_spec_ax.set_yscale(yscale)
+            self.roi_spec_ax.grid(True, which=("both" if yscale=="log" else "major"), alpha=0.25)
+            # keep x edges exact
+            self.roi_spec_ax.set_xlim(float(x.min()), float(x.max()))
+            if self.roi_spec_ax.get_legend_handles_labels()[1]:
+                self.roi_spec_ax.legend(loc="best", fontsize=8)
+
+        # Always (re)ensure the band AFTER any axis changes
+        self._ensure_roi_span_patch()
+        self.roi_spec_canvas.draw_idle()
+
+        # Remember defaults once (for dbl-click reset)
+        if not hasattr(self, "_roi_default_xlim"):
+            self._roi_default_xlim = (float(x.min()), float(x.max()))
+        if not hasattr(self, "_roi_default_ylim"):
+            self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
+            self._roi_default_ylim = self.roi_spec_ax.get_ylim()
+        
+    # ROI spectra zoom handlers
+    def _on_roi_zoom(self, e0, e1):
+        if e0 is None or e1 is None or e0.xdata is None or e1.xdata is None or e0.ydata is None or e1.ydata is None:
+            return
+        ax = self.roi_spec_ax
+        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
+        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
+        if x0 == x1:
+            xr = ax.get_xlim(); pad = max(1e-9, 0.02*(xr[1]-xr[0])); x0, x1 = (x0-pad, x1+pad)
+        if y0 == y1:
+            yr = ax.get_ylim(); pad = max(1e-12, 0.02*abs(yr[1]-yr[0])); y0, y1 = (y0-pad, y1+pad)
+        if self.yscale.currentText() == "log":
+            y0 = max(self._eps, y0); y1 = max(y0*1.001, y1)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        self.roi_spec_canvas.draw_idle()
+
+    def _reset_roi_spec_zoom(self):
+        """Reset ROI spectra axes limits to full X and autorange Y."""
+        x, _, _ = self._x_axis()
+        self.roi_spec_ax.set_xlim(float(x.min()), float(x.max()))
+        self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
+        self.roi_spec_canvas.draw_idle()
+
+    def _maybe_reset_roi_zoom(self, event):
+        if event is None or event.inaxes is None:
+            return
+        if event.inaxes is self.roi_spec_ax and event.dblclick and event.button == MouseButton.RIGHT:
+            # Temporarily disable the right-drag zoomer to avoid conflicts with the dblclick
+            try:
+                if self._roi_zoom_sel is not None:
+                    self._roi_zoom_sel.set_active(False)
+            except Exception:
+                pass
+
+            # Make sure we have stored defaults (done on first draw in _render_roi_spectra)
+            x, _, _ = self._x_axis()
+            if not hasattr(self, "_roi_default_xlim"):
+                self._roi_default_xlim = (float(x.min()), float(x.max()))
+            if not hasattr(self, "_roi_default_ylim"):
+                self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
+                self._roi_default_ylim = self.roi_spec_ax.get_ylim()
+
+            # Restore BOTH X and Y to true defaults (no fresh autoscale)
+            self.roi_spec_ax.set_xlim(*self._roi_default_xlim)
+            self.roi_spec_ax.set_ylim(*self._roi_default_ylim)
+
+            # Ensure log constraints if needed
+            if self.yscale.currentText() == "log":
+                lo, hi = self.roi_spec_ax.get_ylim()
+                lo = max(self._eps, lo); hi = max(lo * 1.001, hi)
+                self.roi_spec_ax.set_ylim(lo, hi)
+
+            self.roi_spec_canvas.draw_idle()
+
+            # Re-enable the right-drag zoomer
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self._roi_zoom_sel and self._roi_zoom_sel.set_active(True))
+
+    def _zoom_to_roi_if_exists(self):
+        """Used by cluster toggles: zoom to ROI only if a rectangle already exists."""
+        if hasattr(self, "_last_rect"):
+            self._zoom_to_roi()
+
+    def _zoom_to_roi(self):
+        """Zoom BOTH heatmaps to the current rectangle ROI (if any), preserving overlays."""
+        if not hasattr(self, "_last_rect"):
+            return
+        x0, y0, x1, y1 = self._last_rect
+        # set limits on BOTH canvases (origin='upper')
+        for ax in (self.roi_ax, self.map_ax):
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y1, y0)
+        # keep the focus hatched overlays aligned with current rect
+        self._update_roi_overlays(clear_only=False)
+        self.roi_canvas.draw_idle()
+        self.map_canvas.draw_idle()
+
+    def _reset_roi_bars(self):
+        """Set the ROI channel bars to cover ALL channels (keep the gray band visible)."""
+        x, _, _ = self._x_axis()
+        lo, hi = float(x.min()), float(x.max())
+        # this emits spanChanged → updates heatmaps + bands everywhere
+        self._set_span(lo, hi)
+        # Ensure the persistent gray bands are displayed everywhere
+        self._update_all_row_span_overlays()
+
+    # ---------------- Exports ----------------
+    def _save_spectra_png(self):
+        fd = QFileDialog(self, "Save spectra PNG", "spectra.png", "PNG Image (*.png)")
+        fd.setOption(QFileDialog.DontUseNativeDialog, True)
+        fd.setAcceptMode(QFileDialog.AcceptSave)
+        if fd.exec() != QFileDialog.Accepted: return
+        path = fd.selectedFiles()[0]
+        if not path.lower().endswith(".png"): path += ".png"
+        try: self.spec_fig.savefig(path, dpi=220)
+        except Exception as e: QMessageBox.critical(self, "Export error", str(e))
+
+    def _export_spectra(self):
+        try:
+            dlg = SpectraExportDialog(self, default_mode=self.agg_combo.currentText())
+        except Exception:
+            dlg = None
+        if dlg and dlg.exec() != QDialog.Accepted:
+            return
+        opts = dlg.get_opts() if dlg else {"format":"csv","log_safe":False,"epsilon":1e-12,"include_meta":False}
+
+        x, _, _ = self._x_axis()
+        out = {"x": x}
+        mask = np.ones(self.N, dtype=bool)  # Export from Spectra tab uses ALL pixel
+        agg = self.agg_combo.currentText()
+        for r, row in enumerate(self.rows, start=1):
+            for cid in sorted(row["clusters"]):
+                idx = (self.labels == cid) & mask
+                if not np.any(idx): continue
+                Y = self.spectra[idx]
+                y = np.nanmean(Y, axis=0) if agg=="mean" else np.nansum(Y, axis=0)
+                out[f"row{r}_cluster{cid}"] = y
+
+        df = pd.DataFrame(out)
+        if opts.get("log_safe", False):
+            eps = float(opts.get("epsilon", 1e-12))
+            for col in df.columns[1:]:
+                df[col] = np.where(df[col] <= 0, eps, df[col])
+
+        if opts.get("format","csv") == "csv":
+            fd = QFileDialog(self); fd.setOption(QFileDialog.DontUseNativeDialog, True)
+            fd.setAcceptMode(QFileDialog.AcceptSave)
+            fd.setNameFilter("CSV Files (*.csv)"); fd.selectFile("spectra.csv")
+            if fd.exec() != QFileDialog.Accepted: return
+            path = fd.selectedFiles()[0]
+            if not path.lower().endswith(".csv"): path += ".csv"
+            try: df.to_csv(path, index=False)
+            except Exception as e: QMessageBox.critical(self, "Export error", str(e))
+        else:
+            fd = QFileDialog(self); fd.setOption(QFileDialog.DontUseNativeDialog, True)
+            fd.setAcceptMode(QFileDialog.AcceptSave)
+            fd.setNameFilter("Excel Files (*.xlsx)"); fd.selectFile("spectra.xlsx")
+            if fd.exec() != QFileDialog.Accepted: return
+            path = fd.selectedFiles()[0]
+            if not path.lower().endswith(".xlsx"): path += ".xlsx"
+            try:
+                with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+                    df.to_excel(writer, index=False, sheet_name="Spectra")
+                    if opts.get("include_meta", False):
+                        meta = pd.DataFrame({
+                            "N":[self.N], "C":[self.C], "Y-scale":[self.yscale.currentText()],
+                            "Aggregate":[self.agg_combo.currentText()]
+                        })
+                        meta.to_excel(writer, index=False, sheet_name="Meta")
+            except Exception as e:
+                QMessageBox.critical(self, "Export error", str(e))
+
+    def _save_heatmap_png(self):
+        fd = QFileDialog(self); fd.setOption(QFileDialog.DontUseNativeDialog, True)
+        fd.setAcceptMode(QFileDialog.AcceptSave)
+        fd.setNameFilter("PNG Images (*.png)"); fd.selectFile("heatmap.png")
+        if fd.exec() != QFileDialog.Accepted: return
+        path = fd.selectedFiles()[0]
+        if not path.lower().endswith(".png"): path += ".png"
+        try: self.map_fig.savefig(path, dpi=200)
+        except Exception as e: QMessageBox.critical(self, "Export error", str(e))
+
+    def _export_heatmap_csv(self):
+        fd = QFileDialog(self); fd.setOption(QFileDialog.DontUseNativeDialog, True)
+        fd.setAcceptMode(QFileDialog.AcceptSave)
+        fd.setNameFilter("CSV Files (*.csv)"); fd.selectFile("heatmap.csv")
+        if fd.exec() != QFileDialog.Accepted: return
+        path = fd.selectedFiles()[0]
+        if not path.lower().endswith(".csv"): path += ".csv"
+        try:
+            img = self._heatmap_array(keep_clusters=None)
+            yy, xx = np.indices(img.shape)
+            df = pd.DataFrame({"X":xx.ravel(), "Y":yy.ravel(), "Value":img.ravel()})
+            df.to_csv(path, index=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Export error", str(e))
+
+    def _make_one_per_cluster(self):
+        self.rows = [{"clusters": {cid}, "ylim": None} for cid in range(self.k)]
+        self._refresh_row_select()
+        self._render_spectra_rows()
+
+class SpectraExportDialog(QDialog):
+    def __init__(self, parent=None, default_mode="sum"):
+        super().__init__(parent)
+        self.setWindowTitle("Export spectra")
+        self.setModal(True)
+        lay = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["Excel (.xlsx)", "CSV (.csv)"])
+        form.addRow("Format:", self.format_combo)
+
+        self.safe_box = QCheckBox("Make log-plot friendly (replace ≤ 0 by ε)")
+        self.safe_box.setChecked(True)
+        form.addRow("", self.safe_box)
+
+        self.eps_spin = QDoubleSpinBox()
+        self.eps_spin.setDecimals(12)
+        self.eps_spin.setRange(1e-20, 1e-3)
+        self.eps_spin.setSingleStep(1e-12)
+        self.eps_spin.setValue(1e-12)
+        form.addRow("ε value:", self.eps_spin)
+
+        self.meta_box = QCheckBox("Include metadata sheet (Excel)")
+        self.meta_box.setChecked(True)
+
+        self.chart_box = QCheckBox("Embed chart (log y-axis) (Excel)")
+        self.chart_box.setChecked(True)
+
+        form.addRow("", self.meta_box)
+        form.addRow("", self.chart_box)
+
+        lay.addLayout(form)
+
+        # Ok/Cancel
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+        # Enable/disable Excel-only opts
+        def toggle_excel_opts():
+            excel = self.format_combo.currentIndex() == 0
+            self.meta_box.setEnabled(excel)
+            self.chart_box.setEnabled(excel)
+        self.format_combo.currentIndexChanged.connect(toggle_excel_opts)
+        toggle_excel_opts()
+
+    def get_opts(self):
+        return {
+            "format": "xlsx" if self.format_combo.currentIndex() == 0 else "csv",
+            "log_safe": self.safe_box.isChecked(),
+            "epsilon": float(self.eps_spin.value()),
+            "include_meta": self.meta_box.isChecked(),
+            "embed_chart": self.chart_box.isChecked(),
+        }

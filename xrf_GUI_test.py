@@ -17,8 +17,9 @@ from PySide6.QtGui import (
     )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from matplotlib.colors import ListedColormap, to_hex
+from matplotlib.colors import ListedColormap, to_hex, LogNorm
 import matplotlib.cm as cm
+import matplotlib as mpl
 from matplotlib.ticker import LogLocator, NullFormatter
 from functions_refactored import *
 from sklearn.decomposition import PCA, NMF
@@ -30,6 +31,12 @@ from sklearn.metrics import silhouette_score
 from sklearn.metrics import davies_bouldin_score
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import matplotlib.patches as mpatches
+
+import json, math
+import h5py
+from dataclasses import dataclass, asdict
+from matplotlib.widgets import RectangleSelector
+import matplotlib.pyplot as plt
 
 class ClusterSelectionDialog(QDialog):
     def __init__(self, clustered_df, parent=None):
@@ -82,63 +89,6 @@ class ImageCanvas(FigureCanvas):
         self.ax.clear()
         self.ax.text(0.5, 0.5, label, ha='center', va='center', fontsize=12)
         self.draw()
-
-class SpectraExportDialog(QDialog):
-    def __init__(self, parent=None, default_mode="sum"):
-        super().__init__(parent)
-        self.setWindowTitle("Export spectra")
-        self.setModal(True)
-        lay = QVBoxLayout(self)
-
-        form = QFormLayout()
-        self.format_combo = QComboBox()
-        self.format_combo.addItems(["Excel (.xlsx)", "CSV (.csv)"])
-        form.addRow("Format:", self.format_combo)
-
-        self.safe_box = QCheckBox("Make log-plot friendly (replace ≤ 0 by ε)")
-        self.safe_box.setChecked(True)
-        form.addRow("", self.safe_box)
-
-        self.eps_spin = QDoubleSpinBox()
-        self.eps_spin.setDecimals(12)
-        self.eps_spin.setRange(1e-20, 1e-3)
-        self.eps_spin.setSingleStep(1e-12)
-        self.eps_spin.setValue(1e-12)
-        form.addRow("ε value:", self.eps_spin)
-
-        self.meta_box = QCheckBox("Include metadata sheet (Excel)")
-        self.meta_box.setChecked(True)
-
-        self.chart_box = QCheckBox("Embed chart (log y-axis) (Excel)")
-        self.chart_box.setChecked(True)
-
-        form.addRow("", self.meta_box)
-        form.addRow("", self.chart_box)
-
-        lay.addLayout(form)
-
-        # Ok/Cancel
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        lay.addWidget(buttons)
-
-        # Enable/disable Excel-only opts
-        def toggle_excel_opts():
-            excel = self.format_combo.currentIndex() == 0
-            self.meta_box.setEnabled(excel)
-            self.chart_box.setEnabled(excel)
-        self.format_combo.currentIndexChanged.connect(toggle_excel_opts)
-        toggle_excel_opts()
-
-    def get_opts(self):
-        return {
-            "format": "xlsx" if self.format_combo.currentIndex() == 0 else "csv",
-            "log_safe": self.safe_box.isChecked(),
-            "epsilon": float(self.eps_spin.value()),
-            "include_meta": self.meta_box.isChecked(),
-            "embed_chart": self.chart_box.isChecked(),
-        }
     
 
 class XRFGui(QMainWindow):
@@ -553,6 +503,13 @@ class XRFGui(QMainWindow):
         self.cluster_spectra_button.clicked.connect(
             lambda: self._open_dialog_safely(self.show_cluster_spectra_popup)
         )
+
+        self.spectra_roi_button = QPushButton("Spectra & ROI…")
+        self.spectra_roi_button.setEnabled(True)
+        self.spectra_roi_button.clicked.connect(
+            lambda: self._open_dialog_safely(self.open_spectra_roi_dialog)
+        )
+        row.addWidget(self.spectra_roi_button)
 
         self.cluster_conc_button = QPushButton("Cluster Concentrations")
         self.cluster_conc_button.setEnabled(True)
@@ -984,10 +941,10 @@ class XRFGui(QMainWindow):
             }
             
             # Store stable RGBA list
-            base = cm.get_cmap("tab20", k)  # k = number of clusters
-            self.cluster_rgba = [base(i) for i in range(k)]
+            base = mpl.colormaps["tab20"].resampled(k)
+            self.cluster_rgba = list(base.colors)          # k RGBA rows
             self.cluster_cmap = ListedColormap(self.cluster_rgba)
-
+            
             self.pipeline_config["cluster_cmap"] = self.cluster_cmap
 
             # Log summary
@@ -995,6 +952,10 @@ class XRFGui(QMainWindow):
             log_lines = [f"KMeans clustering complete using base: {used_base}"]
             for u, c in zip(unique, counts):
                 log_lines.append(f"Cluster {u}: {c} samples")
+
+            total = counts.sum()
+            pct_by_cluster = {int(u): (100.0 * int(c) / float(total)) for u, c in zip(unique, counts)}
+            self.pipeline_config["cluster_pct"] = pct_by_cluster
 
             self.log_output.append("\n".join(log_lines))
             self.mark_button_done(self.run_clustering_button)
@@ -1203,35 +1164,68 @@ class XRFGui(QMainWindow):
             self.left_canvas.draw()
             return
 
+        # --- pull labels + stats ---
+        clustering = self.pipeline_config.get("clustering", {})
+        labels = np.asarray(clustering.get("labels", []), dtype=int)
+        if labels.size == 0:
+            self.left_canvas.draw()
+            return
+
+        k = len(self.cluster_rgba)
+        counts = np.bincount(labels, minlength=k)
+        total = int(counts.sum())
+        # avoid div-by-zero
+        pcts = (counts / total * 100.0) if total > 0 else np.zeros_like(counts, dtype=float)
+
         ax = self.left_canvas.ax
 
         # place a slim inset just OUTSIDE the left edge of the image axes
-        LEG_SHIFT = 0.12  # increase to push farther left
+        # (slightly wider so the new text fits nicely)
+        LEG_SHIFT = 0.75
         leg_ax = inset_axes(
             ax,
-            width="9%", height="80%",
+            width="12%", height="82%",
             loc="center left",
-            bbox_to_anchor=(-LEG_SHIFT, 0.0, 1.0, 1.0),  # 4-tuple required with % sizes
+            bbox_to_anchor=(-LEG_SHIFT, 0.0, 1.0, 1.0),
             bbox_transform=ax.transAxes,
             borderpad=0.0,
         )
         self._left_legend_ax = leg_ax
         leg_ax.set_axis_off()
 
-        k = len(self.cluster_rgba)
+        # header: total pixels
+        leg_ax.text(
+            0.02, 1.02,
+            f"Total: {total:,} px",
+            transform=leg_ax.transAxes,
+            ha="left", va="bottom",
+            fontsize=9, fontweight="bold"
+        )
+
         visible = getattr(self, "visible_clusters", set(range(k)))
 
+        # rows
         for i in range(k):
             y = 1 - (i + 0.5) / k
             r, g, b, a = self.cluster_rgba[i]
             color = (r, g, b, 0.25) if i not in visible else (r, g, b, a)
 
-            rect = mpatches.Rectangle((0.05, y - 0.035), 0.4, 0.07,
-                                    transform=leg_ax.transAxes,
-                                    facecolor=color, edgecolor="k", lw=0.5)
+            # swatch
+            rect = mpatches.Rectangle(
+                (0.05, y - 0.035), 0.38, 0.07,
+                transform=leg_ax.transAxes,
+                facecolor=color, edgecolor="k", lw=0.5, clip_on=False
+            )
             leg_ax.add_patch(rect)
-            leg_ax.text(0.50, y, f"{i}", transform=leg_ax.transAxes,
-                        ha="left", va="center", fontsize=9)
+
+            # label text: "id — XX.X% (n=###)"
+            leg_ax.text(
+                0.47, y,
+                f"{i} — {pcts[i]:.1f}% (n={counts[i]:,})",
+                transform=leg_ax.transAxes,
+                ha="left", va="center",
+                fontsize=9
+            )
 
         self.left_canvas.draw()
 
@@ -1288,6 +1282,14 @@ class XRFGui(QMainWindow):
         if self._spectra_dlg and self._spectra_dlg.isVisible():
             # just redraw with the current mean/sum choice
             self.show_cluster_spectra_popup(use_mean=self._spectra_use_mean)
+        
+        # Keep pipeline_config as the single source of truth for colors
+        self.pipeline_config["cluster_rgba"] = list(self.cluster_rgba)
+
+        # If Spectra/ROI dialog is open, push colors live
+        dlg = getattr(self, "_spectra_roi_dialog", None)
+        if dlg and dlg.isVisible():
+            dlg.set_cluster_colors(self.pipeline_config["cluster_rgba"])
 
     def _populate_umap_metrics(self):
         # sections: (title, [(metric, description, needs_kwds)])
@@ -1866,8 +1868,8 @@ class XRFGui(QMainWindow):
         elif hasattr(self, "cluster_rgba") and self.cluster_rgba:
             colors = [to_hex(tuple(self.cluster_rgba[i % len(self.cluster_rgba)][:3])) for i in range(k)]
         else:
-            base = cm.get_cmap("tab20", k)
-            colors = [to_hex(base(i)) for i in range(k)]
+            base = mpl.colormaps["tab20"].resampled(k)
+            colors = [to_hex(c) for c in base.colors]
 
         spectra = self._stream_cluster_spectra(use_mean=self._spectra_use_mean)
         if spectra is None:
@@ -2138,32 +2140,56 @@ class XRFGui(QMainWindow):
 
         vbox.addWidget(tabs, 1)
 
-        # ---- helpers
+        # ---------- helpers (define BEFORE use) ----------
+        import re, numpy as np, pandas as pd
+        def _parse_cluster_id(x):
+            if isinstance(x, (int, np.integer)):
+                return int(x)
+            m = re.search(r"\d+", str(x))
+            return int(m.group()) if m else None
+
+        def _cluster_row_labels(df_index):
+            """Return (labels, ids) where labels look like 'Cluster i (xx.x%)'."""
+            pct = self.pipeline_config.get("cluster_pct", {})
+            idx_vals = list(df_index)
+            cluster_ids = [_parse_cluster_id(x) for x in idx_vals]
+            labels = [
+                (f"Cluster {cid} ({pct.get(cid, 0.0):.1f}%)" if cid is not None else str(x))
+                for x, cid in zip(idx_vals, cluster_ids)
+            ]
+            return labels, cluster_ids
+
         def _render_table(df):
             n_rows, n_cols = df.shape
-            table.clear(); table.setRowCount(n_rows); table.setColumnCount(n_cols + 1)
+            table.clear()
+            table.setRowCount(n_rows)
+            table.setColumnCount(n_cols + 1)  # +1 for the "Cluster" label column
             headers = ["Cluster"] + list(df.columns)
             table.setHorizontalHeaderLabels(headers)
             table.verticalHeader().setVisible(False)
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
 
-            # cluster color for first column
             cmap = getattr(self, "cluster_rgba", None)
+            k = len(cmap) if cmap is not None else 0
+
             for r, idx in enumerate(df.index):
-                try: cid = int(idx.split()[-1])
-                except Exception: cid = r
-                name_item = QTableWidgetItem(idx)
-                if cmap:
+                cid = _parse_cluster_id(idx)
+                name_item = QTableWidgetItem(str(idx))
+                if cmap is not None and cid is not None and 0 <= cid < k:
                     qc = QColor.fromRgbF(*cmap[cid][:3])
-                    name_item.setBackground(qc); name_item.setForeground(QColor("white"))
+                    name_item.setBackground(qc)
+                    name_item.setForeground(QColor("white"))
                 table.setItem(r, 0, name_item)
+
                 for j, val in enumerate(df.iloc[r].values, start=1):
-                    s = "" if (val is None or (isinstance(val, float) and not np.isfinite(val))) else f"{val:.6g}"
+                    if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                        s = ""
+                    else:
+                        s = f"{val:.6g}"
                     table.setItem(r, j, QTableWidgetItem(s))
 
         def _render_heatmap(df):
             nonlocal hm_ax
-            # Clear the entire figure to avoid piling up colorbars
             hm_fig.clear()
             hm_ax = hm_fig.add_subplot(111)
 
@@ -2172,35 +2198,34 @@ class XRFGui(QMainWindow):
                 hm_canvas.draw(); return
 
             im = hm_ax.imshow(df.values, aspect="auto", cmap="viridis")
-            # X ticks: rotate & thin out for many elements
             hm_ax.set_xticks(range(df.shape[1]))
             hm_ax.set_xticklabels(df.columns, rotation=60, ha="right", fontsize=8)
-            # Y ticks: color with cluster colors
-            hm_ax.set_yticks(range(df.shape[0]))
-            hm_ax.set_yticklabels(df.index, fontsize=9)
+
+            labels, cluster_ids = _cluster_row_labels(df.index)
+            hm_ax.set_yticks(np.arange(df.shape[0]))
+            hm_ax.set_yticklabels(labels, fontsize=9)
+
+            # color ticks by cluster id (robust)
             if hasattr(self, "cluster_rgba"):
-                for t in hm_ax.get_yticklabels():
-                    try:
-                        cid = int(t.get_text().split()[-1])
+                k = len(self.cluster_rgba)
+                for t, cid in zip(hm_ax.get_yticklabels(), cluster_ids):
+                    if cid is not None and 0 <= cid < k:
                         r, g, b, a = self.cluster_rgba[cid]
                         t.set_color((r, g, b))
-                    except Exception:
-                        pass
 
             hm_ax.set_title(f"Cluster concentrations ({agg_combo.currentText()})")
             cbar = hm_fig.colorbar(im, ax=hm_ax, fraction=0.045, pad=0.02)
             cbar.set_label("value", rotation=90)
 
             if annotate.isChecked():
-                # Put values inside cells; rotate if user asks
                 rotate = 90 if ann_style.currentText() == "vertical" else 0
                 norm = im.norm
-                for r in range(df.shape[0]):
-                    for c in range(df.shape[1]):
-                        val = df.iat[r, c]
+                for rr in range(df.shape[0]):
+                    for cc in range(df.shape[1]):
+                        val = df.iat[rr, cc]
                         if np.isfinite(val):
                             color = "white" if norm(val) > 0.6 else "black"
-                            hm_ax.text(c, r, f"{val:.2g}", ha="center", va="center",
+                            hm_ax.text(cc, rr, f"{val:.2g}", ha="center", va="center",
                                     fontsize=7, rotation=rotate, color=color)
 
             hm_canvas.draw()
@@ -2215,9 +2240,18 @@ class XRFGui(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e)); return
 
-            dlg._conc_df = df
+            dlg._conc_df = df  # raw
+
+            # Labeled copy for table & CSV (prefix a numeric % column too)
+            labels, ids = _cluster_row_labels(df.index)
+            df_lbl = df.copy()
+            df_lbl.index = labels
+            pct_map = self.pipeline_config.get("cluster_pct", {})
+            df_lbl.insert(0, "Percent", [pct_map.get(cid, 0.0) if cid is not None else np.nan for cid in ids])
+            dlg._conc_df_labeled = df_lbl
+
             _render_heatmap(df)
-            _render_table(df)
+            _render_table(df_lbl)
 
         # initial + wires
         render()
@@ -2235,7 +2269,7 @@ class XRFGui(QMainWindow):
         vbox.addWidget(btns)
 
         def save_csv():
-            df = getattr(dlg, "_conc_df", None)
+            df = getattr(dlg, "_conc_df_labeled", None)  # labeled df (with Percent col)
             if df is None: return
             base = f"cluster_concentrations_{agg_combo.currentText()}"
             if use_all.isChecked(): base += "_ALL"
@@ -2257,33 +2291,35 @@ class XRFGui(QMainWindow):
             path = self._get_save_filename("Save heatmap PNG", base + ".png", "PNG Image (*.png)")
             if not path: return
 
-            # one-shot figure (so it always has a single colorbar)
             fig = Figure(figsize=(max(6, df.shape[1]*0.28), max(3.5, df.shape[0]*0.55)), constrained_layout=True)
             ax = fig.add_subplot(111)
             im = ax.imshow(df.values, aspect="auto", cmap="viridis")
             ax.set_xticks(range(df.shape[1]))
             ax.set_xticklabels(df.columns, rotation=60, ha="right", fontsize=8)
+
+            labels, cluster_ids = _cluster_row_labels(df.index)
             ax.set_yticks(range(df.shape[0]))
-            ax.set_yticklabels(df.index, fontsize=9)
+            ax.set_yticklabels(labels, fontsize=9)
+
             if hasattr(self, "cluster_rgba"):
-                for t in ax.get_yticklabels():
-                    try:
-                        cid = int(t.get_text().split()[-1]); r,g,b,a = self.cluster_rgba[cid]
-                        t.set_color((r,g,b))
-                    except Exception:
-                        pass
+                k = len(self.cluster_rgba)
+                for t, cid in zip(ax.get_yticklabels(), cluster_ids):
+                    if cid is not None and 0 <= cid < k:
+                        r, g, b, a = self.cluster_rgba[cid]
+                        t.set_color((r, g, b))
+
             ax.set_title(f"Cluster concentrations ({agg_combo.currentText()})")
             cbar = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.02); cbar.set_label("value", rotation=90)
 
             if annotate.isChecked():
                 rotate = 90 if ann_style.currentText() == "vertical" else 0
                 norm = im.norm
-                for r in range(df.shape[0]):
-                    for c in range(df.shape[1]):
-                        val = df.iat[r, c]
+                for rr in range(df.shape[0]):
+                    for cc in range(df.shape[1]):
+                        val = df.iat[rr, cc]
                         if np.isfinite(val):
                             color = "white" if norm(val) > 0.6 else "black"
-                            ax.text(c, r, f"{val:.2g}", ha="center", va="center",
+                            ax.text(cc, rr, f"{val:.2g}", ha="center", va="center",
                                     fontsize=7, rotation=rotate, color=color)
 
             try:
@@ -2431,6 +2467,33 @@ class XRFGui(QMainWindow):
         self.log_output.append("Imported raw images.csv and processed it exactly like HDF load.")
         self.left_canvas.show_dummy("Imported elemental map")
 
+    def open_spectra_roi_dialog(self):
+        # Reuse an open dialog if present
+        dlg = getattr(self, "_spectra_roi_dialog", None)
+        if dlg and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+
+        # Create new (modeless) dialog and keep a handle
+        self._spectra_roi_dialog = SpectraRoiDialog(self)
+        self._spectra_roi_dialog.setModal(False)
+
+        # Push current colors so the dialog always matches the editor
+        try:
+            self._spectra_roi_dialog.set_cluster_colors(
+                self.pipeline_config.get("cluster_rgba", self.cluster_rgba)
+            )
+        except Exception:
+            pass
+
+        # When the dialog is destroyed, drop the handle so we can open it again
+        self._spectra_roi_dialog.destroyed.connect(
+            lambda *_: setattr(self, "_spectra_roi_dialog", None)
+        )
+
+        self._spectra_roi_dialog.show()
+            
 if __name__ == "__main__":
     QApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
 
