@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QAbstractItemView, QTableWidget,
     QTableWidgetItem, QComboBox, QDoubleSpinBox,
     QGraphicsView, QGraphicsScene,QToolBar, QTabWidget,
-    QFormLayout, QSpinBox, QSizePolicy
+    QFormLayout, QSpinBox, QSizePolicy, QSplitter,
+    QGroupBox,
     )
 from PySide6.QtGui import QPixmap, QImage, QPainter, QFont, QGuiApplication, QAction
 from PySide6.QtCore import Qt, Signal, QSignalBlocker, QTimer,QEvent, QPointF, QSize, QCoreApplication
@@ -1266,21 +1267,20 @@ def create_augmented_dataset(df, original_coords, element_scaler="standard", xy_
 
 class SpectraRoiDialog(QDialog):
     """
-    Spectra & ROI with ONE global x-range (channel/energy span) and ONE global pixel ROI mask.
+    Fast Spectra & ROI viewer.
 
-    Spectra tab (one column, multiple rows):
-      • Each row overlays a chosen subset of clusters (keeps your cluster colors).
-      • Row settings via “Edit Row…” (clusters per row; Auto Y or manual Y).
-      • Global: Aggregate (mean/sum), Y-scale (linear/log), Show % in legend.
-      • LEFT-drag on any row or ROI-bottom spectra → set global span (per-row bands update).
-      • RIGHT-drag on any row / ROI-bottom spectra → zoom; RIGHT double-click → reset zoom.
-      • Save PNG, Export CSV/Excel.
-
-    ROI Imaging tab:
-      • Left: heatmap for ENABLED clusters; Right: heatmap for ALL clusters (reference).
-      • Rectangle ROI LEFT-drag on left heatmap: zooms both heatmaps, sets global pixel mask.
-      • Bottom: spectra of enabled clusters (shares global span; shows its own band).
+    What's new in this version
+    --------------------------
+    • Grid control: Off / Auto / Manual
+        - Off: clean canvas, no ticks.
+        - Auto: integer grid that adapts with zoom (no fractional labels).
+        - Manual: integer grid with user-set spacing (≥px) and opacity (α).
+      Axis tick values are shown only when grid is enabled.
+    • Hover: extremely light, toggleable (OFF by default). Shows x, y, cluster id,
+      and the current heatmap values (enabled vs all).
+    • Keeps all previous speed-ups (streaming sums, persistent imshow/colorbars, etc.).
     """
+
     spanChanged = Signal(tuple)   # (lo, hi)
     maskChanged = Signal(object)  # bool mask
 
@@ -1293,10 +1293,11 @@ class SpectraRoiDialog(QDialog):
         self.setSizeGripEnabled(True)
 
         # ---- inputs ----
-        self.pcfg    = getattr(parent, "pipeline_config", {})
-        self.labels  = np.asarray(self.pcfg.get("clustering", {}).get("labels", []))
-        self.k       = int(self.pcfg.get("clustering", {}).get(
-                        "num_clusters", (int(self.labels.max())+1) if self.labels.size else 0))
+        self.parent_gui = parent
+        self.pcfg    = getattr(parent, "pipeline_config", {}) or {}
+        cl           = (self.pcfg.get("clustering") or {})
+        self.labels  = np.asarray(cl.get("labels", []), dtype=np.int32)
+        self.k       = int(cl.get("num_clusters", (int(self.labels.max())+1) if self.labels.size else 0))
         self.xy      = self.pcfg.get("original_coordinates", None)
         self.spectra = self.pcfg.get("raw_spectra", None)   # (N, C)
         self.energy  = self.pcfg.get("energy_keV", None)    # (C,) optional
@@ -1305,34 +1306,60 @@ class SpectraRoiDialog(QDialog):
             QMessageBox.critical(self, "Missing data", "Run loading & clustering first.")
             self.reject(); return
 
-        # If spectra are missing (CSV-only path), use the same HDF dataset picker you use elsewhere.
         if self.spectra is None:
             if not self._ensure_spectra_loaded_from_hdf():
                 self.reject(); return
 
+        # Canonical dtypes / memory layout
+        self.spectra = np.asarray(self.spectra, dtype=np.float32, order="C")
         self.N, self.C = self.spectra.shape
+        self._eps = np.float32(1e-12)
+
+        # XY cache
+        self._xs = self.xy["X"].astype(np.int32).to_numpy()
+        self._ys = self.xy["Y"].astype(np.int32).to_numpy()
+        self.W = int(self._xs.max()) + 1
+        self.H = int(self._ys.max()) + 1
+
+        # index grid for super-cheap hover (maps screen pixel → row index, or -1)
+        self._index_grid = -np.ones((self.H, self.W), dtype=np.int32)
+        if self.N:
+            self._index_grid[self._ys, self._xs] = np.arange(self.N, dtype=np.int32)
+
+        # Global state
         self.current_roi_mask = np.ones(self.N, dtype=bool)   # global pixel mask
-        self._span_range = None                               # global x-span (lo, hi)
-        self._eps = 1e-12                                     # log floor
-        self._span_idx_range = None   # (i0, i1) in channel index space
-
-        # rows model: list of dicts: {"clusters": set[int], "ylim": None|(ymin,ymax)}
-        self.rows = [{"clusters": set(range(self.k)), "ylim": None}]
-
-        # per-row zoom + span bookkeeping
-        self._row_zoomers   = []      # RectangleSelector per row (RIGHT-drag)
-        self._row_defaults  = []      # (xlim_default, ylim_default) per row (for right-dblclick)
-        self._roi_zoom_sel  = None    # RIGHT-drag zoom on ROI spectra
-
-        # persistent bands: one per row + one on ROI spectra
-        self._row_span_patches   = [] # patch per row
-        self._roi_span_patch     = None
-
-        # span selectors (LEFT-drag). We keep them around but hide their visuals after each selection.
+        self._span_range = None                               # for UI echo
+        self._span_idx_range = None                           # (i0, i1) inclusive
+        self._row_zoomers   = []
+        self._row_defaults  = []
+        self._roi_zoom_sel  = None
+        self._row_span_patches = []
+        self._roi_span_patch   = None
         self._row_span_selectors = []
         self._span_roi = None
+        self._grid_lines_left = []
+        self._grid_lines_right = []
+        self._hover_cids = []
 
-        # ---- tabs ----
+        # Cache: per-cluster indices & streaming aggregates (RAM-safe)
+        self._idx_by_cluster = [np.flatnonzero(self.labels == c) for c in range(self.k)]
+        self._cnt_by_cluster = np.array([idx.size for idx in self._idx_by_cluster], dtype=np.int32)
+        self._sum_by_cluster = np.zeros((self.k, self.C), dtype=np.float32)
+        self._compute_cluster_sums_streaming()
+
+        # Cache: prefix sums for fast heatmap span
+        self._prefix = None  # built lazily
+        # Optional % per cluster
+        self._cluster_pct = dict(self.pcfg.get("cluster_pct", {}))
+        if not self._cluster_pct and self.labels.size:
+            u, cnt = np.unique(self.labels, return_counts=True)
+            total = cnt.sum() if cnt.size else 1
+            self._cluster_pct = {int(ui): 100.0 * int(ci) / float(total) for ui, ci in zip(u, cnt)}
+
+        # rows model for spectra tab
+        self.rows = [{"clusters": set(range(self.k)), "ylim": None}]
+
+        # ---- UI ----
         tabs = QTabWidget(self)
 
         # ===================== Spectra tab =====================
@@ -1390,11 +1417,12 @@ class SpectraRoiDialog(QDialog):
             cb.stateChanged.connect(lambda *_: (self._update_heatmaps(),
                                                 self._render_roi_spectra(update_only=False),
                                                 self._update_all_row_span_overlays(),
-                                                ))
+                                                self._update_grids()))
             self.cluster_checks.append(cb); cl_row.addWidget(cb)
         cl_row.addStretch(1)
         roi_v.addLayout(cl_row)
 
+        # canvases
         self.roi_fig = Figure(figsize=(5.2, 4.6), constrained_layout=True)
         self.roi_ax  = self.roi_fig.add_subplot(111)
         self.roi_canvas = FigureCanvas(self.roi_fig)
@@ -1408,19 +1436,53 @@ class SpectraRoiDialog(QDialog):
         canv_row.addWidget(self.map_canvas, 1)
         roi_v.addLayout(canv_row, 1)
 
+        # tools row (ROI + grid + hover)
         tools = QHBoxLayout()
         self.btn_rect        = QPushButton("Rectangle ROI")
         self.btn_zoom_roi    = QPushButton("Zoom to ROI")
         self.btn_reset_bars  = QPushButton("Reset ROI bars")
         self.btn_clear_roi   = QPushButton("Clear ROI")
-
         tools.addWidget(self.btn_rect)
         tools.addWidget(self.btn_zoom_roi)
         tools.addWidget(self.btn_reset_bars)
         tools.addWidget(self.btn_clear_roi)
-        tools.addStretch(1)
+        tools.addSpacing(16)
+
+        # Grid controls
+        tools.addWidget(QLabel("Grid:"))
+        self.grid_mode = QComboBox()
+        self.grid_mode.addItems(["Off", "Auto", "Manual"])
+        self.grid_mode.setCurrentText("Off")  # start clean; we’ll enable after first draw if needed
+        tools.addWidget(self.grid_mode)
+
+        # α (opacity)
+        self.grid_alpha_label = QLabel("α")
+        self.grid_alpha = QDoubleSpinBox()
+        self.grid_alpha.setRange(0.05, 1.0); self.grid_alpha.setSingleStep(0.05)
+        self.grid_alpha.setValue(0.20)
+        self.grid_alpha.setDecimals(2); self.grid_alpha.setFixedWidth(70)
+        tools.addWidget(self.grid_alpha_label); tools.addWidget(self.grid_alpha)
+
+        # ≥px (manual spacing)
+        self.grid_px_label = QLabel("≥px")
+        self.grid_min_px = QSpinBox()
+        self.grid_min_px.setRange(1, 512); self.grid_min_px.setSingleStep(1)
+        self.grid_min_px.setValue(16); self.grid_min_px.setFixedWidth(70)
+        tools.addWidget(self.grid_px_label); tools.addWidget(self.grid_min_px)
+
+        tools.addSpacing(16)
+        # Hover toggle + status
+        self.hover_toggle = QCheckBox("Hover")
+        self.hover_toggle.setChecked(False)  # default OFF
+        self.hover_status = QLabel("x=– y=– | L=– | en=– all=–")
+        self.hover_status.setStyleSheet("QLabel{font-family: Consolas, 'Courier New', monospace; color: #bbb;}")
+        tools.addWidget(self.hover_toggle)
+        tools.addSpacing(6)
+        tools.addWidget(self.hover_status, 1)
+
         roi_v.addLayout(tools)
 
+        # ROI spectra
         self.roi_spec_fig = Figure(figsize=(9.0, 3.3), constrained_layout=True)
         self.roi_spec_ax  = self.roi_spec_fig.add_subplot(111)
         self.roi_spec_canvas = FigureCanvas(self.roi_spec_fig)
@@ -1433,15 +1495,14 @@ class SpectraRoiDialog(QDialog):
         roi_v.addLayout(exp_row)
 
         tabs.addTab(roi_tab, "ROI Imaging")
-
         lay = QVBoxLayout(self); lay.addWidget(tabs)
 
-        # optional hook for external color updates
+        # optional color change hook from GUI
         if hasattr(parent, "cluster_colors_changed"):
             try: parent.cluster_colors_changed.connect(self._on_colors_changed)
             except Exception: pass
 
-        # wire actions
+        # ---- signals ----
         self.agg_combo.currentIndexChanged.connect(lambda *_: (self._render_spectra_rows(),
                                                                self._render_roi_spectra(update_only=False)))
         self.yscale.currentIndexChanged.connect(lambda *_: (self._render_spectra_rows(),
@@ -1458,36 +1519,59 @@ class SpectraRoiDialog(QDialog):
         self.btn_save_png.clicked.connect(self._save_spectra_png)
         self.btn_export.clicked.connect(self._export_spectra)
 
-        # existing
         self.btn_rect.clicked.connect(self._activate_rectangle_roi)
         self.btn_zoom_roi.clicked.connect(self._zoom_to_roi)
         self.btn_reset_bars.clicked.connect(self._reset_roi_bars)
         self.btn_clear_roi.clicked.connect(self._clear_roi)
 
-
         self.btn_save_map.clicked.connect(self._save_heatmap_png)
         self.btn_export_map.clicked.connect(self._export_heatmap_csv)
 
-        # sync span between tabs (and keep zoom)
         self.spanChanged.connect(self._on_span_changed)
 
-        # RIGHT dbl-click reset hooks (rows + ROI spectra)
+        # RIGHT dbl-click reset hooks
         self._press_cid_spec = self.spec_canvas.mpl_connect("button_press_event", self._maybe_reset_row_zoom)
         self._press_cid_roi  = self.roi_spec_canvas.mpl_connect("button_press_event", self._maybe_reset_roi_zoom)
         self._press_cid_map1 = self.roi_canvas.mpl_connect("button_press_event", self._maybe_reset_map_zoom)
         self._press_cid_map2 = self.map_canvas.mpl_connect("button_press_event", self._maybe_reset_map_zoom)
 
-        # ---- initial draws ----
+        # grid/hover signals
+        self.grid_mode.currentTextChanged.connect(self._on_grid_mode_changed)
+        self.grid_alpha.valueChanged.connect(lambda *_: self._update_grids())
+        self.grid_min_px.valueChanged.connect(lambda *_: self._update_grids())
+        self.hover_toggle.toggled.connect(self._toggle_hover)
+
+        # ---- colors (prefer GUI palette) ----
+        self._normalize_and_store_colors()
+
+        # ---- draws ----
         self._cluster_rgba_img = self._build_cluster_image()
-        self._update_heatmaps()
+        self._init_heatmaps_persistent()
+        self._update_heatmaps()                       # set initial data (fast)
         self._render_roi_spectra(update_only=False)
         self._render_spectra_rows()
         self._init_span_selectors()
         self._install_map_zooms()
 
-    # ---------------------- HDF loader (CSV-only path) ----------------------
+        # grid starts “Off”; update visibility of controls and axes once
+        self._sync_grid_controls_visibility()
+        self._update_grids()
+
+    # ------------- memory-safe per-cluster sums (for Spectra tab) -------------
+    def _compute_cluster_sums_streaming(self, chunk=100_000):
+        """
+        Accumulate per-cluster sums in chunks to avoid huge temporaries.
+        """
+        for c, idx in enumerate(self._idx_by_cluster):
+            if idx.size == 0:
+                continue
+            for s in range(0, idx.size, chunk):
+                sl = idx[s:s+chunk]
+                self._sum_by_cluster[c] += self.spectra[sl].sum(axis=0, dtype=np.float32)
+
+    # ---------------------- HDF loader (optional) ----------------------
     def _ensure_spectra_loaded_from_hdf(self) -> bool:
-        """When only images.csv was loaded, ask for the HDF and let the user pick a dataset."""
+        # identical to your working path; omitted here for brevity in this comment
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("HDF missing")
@@ -1501,8 +1585,6 @@ class SpectraRoiDialog(QDialog):
         h5_path, _ = QFileDialog.getOpenFileName(self, "Select HDF5 file", "", "HDF5 Files (*.h5 *.hdf *.hdf5)")
         if not h5_path:
             return False
-
-        # Use the same dataset picker UI you use elsewhere (tree view)
         picker = DatasetPickerDialog(h5_path, parent=self)
         if picker.exec() != QDialog.Accepted:
             return False
@@ -1510,7 +1592,6 @@ class SpectraRoiDialog(QDialog):
         if not ds_path:
             return False
 
-        # Read and sanity-check against XY
         try:
             with h5py.File(h5_path, "r") as f:
                 data = np.asarray(f[ds_path])
@@ -1533,10 +1614,9 @@ class SpectraRoiDialog(QDialog):
                     QMessageBox.critical(self, "Unsupported dataset", f"Shape {data.shape} not 2D/3D.")
                     return False
 
-                self.spectra = arr.astype(float, copy=False)
+                self.spectra = np.asarray(arr, dtype=np.float32, order="C")
                 self.N, self.C = self.spectra.shape
 
-                # best-effort energy axis from attrs
                 eng = None
                 ds = f[ds_path]
                 for key in ("energy", "energies", "xrf_energies", "energy_keV"):
@@ -1547,7 +1627,6 @@ class SpectraRoiDialog(QDialog):
                 if eng is not None and eng.size == self.C:
                     self.energy = eng
 
-            # persist back
             self.pcfg["raw_spectra"] = self.spectra
             if self.energy is not None:
                 self.pcfg["energy_keV"] = self.energy
@@ -1557,102 +1636,463 @@ class SpectraRoiDialog(QDialog):
             QMessageBox.critical(self, "Import error", str(e))
             return False
 
-    # ----------------------------- helpers -----------------------------
-    def _x_axis(self):
-        if self.energy is not None and np.size(self.energy) == self.C:
-            return np.asarray(self.energy), "Energy (keV)", True
-        return np.arange(self.C), "Channels", False
+    # ----------------------------- COLORS -----------------------------
+    def _gui_palette_now(self):
+        try:
+            if hasattr(self.parent_gui, "cluster_rgba") and self.parent_gui.cluster_rgba:
+                return list(self.parent_gui.cluster_rgba)
+        except Exception:
+            pass
+        pal = self.pcfg.get("cluster_rgba", None)
+        if pal: return list(pal)
+        cmap = self.pcfg.get("cluster_cmap", None)
+        if hasattr(cmap, "colors"):
+            try:
+                return [tuple(map(float, c)) for c in cmap.colors]
+            except Exception:
+                pass
+        return list(mpl.colormaps["tab20"].resampled(max(1, self.k)).colors)
 
-    def _get_cluster_colors(self):
-        rgba = (self.pcfg or {}).get("cluster_rgba", None)
-        if rgba is None:
-            cmap = mpl.colormaps["tab20"].resampled(max(1, self.k))
-            rgba = list(map(tuple, cmap.colors))
-        out = []
-        for c in rgba:
+    def _normalize_and_store_colors(self):
+        pal = self._gui_palette_now()
+        normed = []
+        for c in pal:
             if len(c) == 3: r,g,b = c; a = 1.0
             else: r,g,b,a = c[:4]
             if max(r,g,b,a) > 1.01:
                 r,g,b,a = r/255.0, g/255.0, b/255.0, a/255.0
-            out.append((float(r), float(g), float(b), float(a)))
-        if len(out) < self.k:
-            out += [out[i % len(out)] for i in range(self.k - len(out))]
-        return out[:self.k]
+            normed.append((float(r), float(g), float(b), float(a)))
+        if len(normed) < self.k:
+            extra = list(mpl.colormaps["tab20"].resampled(max(1, self.k)).colors)
+            normed += [tuple(map(float, extra[i % len(extra)])) for i in range(self.k - len(normed))]
+        self.pcfg["cluster_rgba"] = normed[:self.k]
+
+    def _get_cluster_colors(self):
+        self._normalize_and_store_colors()
+        return list(self.pcfg.get("cluster_rgba", []))[:self.k]
 
     def _on_colors_changed(self):
+        self._normalize_and_store_colors()
         self._cluster_rgba_img = self._build_cluster_image()
         self._render_spectra_rows(preserve_limits=True)
         self._render_roi_spectra(update_only=False)
         self._update_heatmaps()
+        self._update_grids()
 
     def set_cluster_colors(self, rgba_list):
-        def _norm_one(c):
+        def _norm(c):
             if len(c) == 3: r,g,b = c; a = 1.0
             else: r,g,b,a = c[:4]
             if max(r,g,b,a) > 1.01:
                 r,g,b,a = r/255.0, g/255.0, b/255.0, a/255.0
             return float(r), float(g), float(b), float(a)
-        rgba = [_norm_one(c) for c in rgba_list]
-        if len(rgba) < self.k:
-            rgba += [rgba[i % len(rgba)] for i in range(self.k - len(rgba))]
-        self.pcfg["cluster_rgba"] = rgba[:self.k]
+        pal = [_norm(c) for c in rgba_list]
+        if len(pal) < self.k:
+            base = list(mpl.colormaps["tab20"].resampled(max(1, self.k)).colors)
+            pal += [tuple(map(float, base[i % len(base)])) for i in range(self.k - len(pal))]
+        self.pcfg["cluster_rgba"] = pal[:self.k]
         self._on_colors_changed()
+
+    # ----------------------------- helpers -----------------------------
+    def _x_axis(self):
+        if self.energy is not None and np.size(self.energy) == self.C:
+            return np.asarray(self.energy, dtype=np.float32), "Energy (keV)", True
+        return np.arange(self.C, dtype=np.float32), "Channels", False
 
     def _refresh_row_select(self):
         self.row_select.blockSignals(True)
         self.row_select.clear()
         for i in range(len(self.rows)):
             self.row_select.addItem(f"Row {i+1}")
-        self.row_select.setCurrentIndex(0)
+        if self.rows:
+            self.row_select.setCurrentIndex(0)
         self.row_select.blockSignals(False)
-    
-    # --- SpanSelector cleanup helpers (remove red bars, keep gray band) ---
-    def _clear_selector_visuals(self, sel):
-        """Remove the selection artists drawn by a SpanSelector/RectangleSelector without disabling it."""
-        if sel is None:
+
+    # ---------------- fast span handling ----------------
+    def _current_span_lo_hi_idx_exclusive(self):
+        if self._span_idx_range is not None:
+            i0, i1 = self._span_idx_range
+            if i1 < i0: i0, i1 = i1, i0
+            i0 = int(max(0, min(self.C-1, i0)))
+            i1 = int(max(0, min(self.C-1, i1)))
+            return (i0, min(self.C, i1 + 1))
+        if self._span_range is None:
+            return (0, self.C)
+        x, _, is_energy = self._x_axis()
+        lo, hi = self._span_range
+        if is_energy:
+            i0 = int(np.clip(np.searchsorted(x, lo, side="left"), 0, self.C))
+            i1 = int(np.clip(np.searchsorted(x, hi, side="right"), 0, self.C))
+            return (min(i0, i1), max(i0, i1))
+        a = int(np.clip(np.floor(min(lo, hi)), 0, self.C))
+        b = int(np.clip(np.ceil (max(lo, hi)), 0, self.C))
+        return (min(a, b), max(a, b))
+
+    def _span_lohi_in_axis_units(self):
+        x, _, _ = self._x_axis()
+        i0, i1_ex = self._current_span_lo_hi_idx_exclusive()
+        i0 = max(0, min(self.C-1, i0))
+        i1 = max(0, min(self.C-1, i1_ex-1))
+        return float(x[i0]), float(x[i1])
+
+    def _update_span_label(self):
+        if self._span_idx_range is None and self._span_range is None:
+            self.span_info.setText("Selected range: (LEFT-drag on any row or ROI spectra)")
             return
-        # Matplotlib changed internals across versions, so try many names safely.
-        for attr in ("_selection_artist", "_rect", "_span", "_lineleft", "_lineright"):
+        lo, hi = self._span_lohi_in_axis_units()
+        x, _, is_energy = self._x_axis()
+        if is_energy:
+            self.span_info.setText(f"Selected range: {lo:.4g} – {hi:.4g} keV")
+        else:
+            self.span_info.setText(f"Selected range: {int(round(lo))} – {int(round(hi))} channels")
+
+    # ---------------- Heatmaps (fast) ----------------
+    def _ensure_prefix(self):
+        if self._prefix is None:
+            self._prefix = np.empty((self.N, self.C+1), dtype=np.float32)
+            self._prefix[:, 0] = 0.0
+            np.cumsum(self.spectra, axis=1, dtype=np.float32, out=self._prefix[:, 1:])
+
+    def _heatmap_vector_for_span(self):
+        self._ensure_prefix()
+        i0, i1 = self._current_span_lo_hi_idx_exclusive()
+        return self._prefix[:, i1] - self._prefix[:, i0]
+
+    def _build_cluster_image(self):
+        rgba = self._get_cluster_colors()
+        img = np.ones((self.H, self.W, 4), dtype=np.float32); img[..., 3] = 0.0
+        img[self._ys, self._xs] = np.asarray(rgba, dtype=np.float32)[self.labels]
+        return img
+
+    def _fast_mask_from_clusters(self, keep_clusters):
+        if keep_clusters is None:
+            return np.ones(self.N, dtype=bool)
+        mask = np.zeros(self.N, dtype=bool)
+        for c in keep_clusters:
+            idx = self._idx_by_cluster[c]
+            if idx.size:
+                mask[idx] = True
+        return mask
+
+    def _init_heatmaps_persistent(self):
+        keep = set(range(self.k))
+        vals = self._heatmap_vector_for_span()
+        img_focus  = np.zeros((self.H, self.W), dtype=np.float32)
+        img_global = np.zeros((self.H, self.W), dtype=np.float32)
+        mask_all   = np.ones(self.N, dtype=bool)
+        mask_keep  = self._fast_mask_from_clusters(keep)
+        img_focus[self._ys[mask_keep],  self._xs[mask_keep]]  = vals[mask_keep]
+        img_global[self._ys[mask_all],  self._xs[mask_all]]   = vals[mask_all]
+
+        self.roi_ax.clear(); self.map_ax.clear()
+        self._im_focus  = self.roi_ax.imshow(img_focus, cmap="inferno", origin="upper", interpolation="nearest")
+        self.roi_ax.set_title("Heatmap (enabled clusters)")
+        self._im_global = self.map_ax.imshow(img_global, cmap="inferno", origin="upper", interpolation="nearest")
+        self.map_ax.set_title("Heatmap (all clusters)")
+
+        # axis off by default; grid logic will turn it on when needed
+        self.roi_ax.axis("off"); self.map_ax.axis("off")
+
+        self._focus_cbar  = self.roi_fig.colorbar(self._im_focus,  ax=self.roi_ax, fraction=0.046, pad=0.03)
+        self._global_cbar = self.map_fig.colorbar(self._im_global, ax=self.map_ax, fraction=0.046, pad=0.03)
+
+        self._rescale_heatmap_norm(img_focus, img_global)
+
+        self._map_default_xlim = (0, self.W - 1)
+        self._map_default_ylim = (self.H - 1, 0)
+
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+    def _update_heatmaps(self):
+        keep = {i for i, cb in enumerate(self.cluster_checks) if cb.isChecked()}
+        vals = self._heatmap_vector_for_span()
+        img_focus  = np.zeros((self.H, self.W), dtype=np.float32)
+        img_global = np.zeros((self.H, self.W), dtype=np.float32)
+
+        mask_all  = np.ones(self.N, dtype=bool)
+        mask_keep = self._fast_mask_from_clusters(keep)
+
+        img_focus[self._ys[mask_keep],  self._xs[mask_keep]]  = vals[mask_keep]
+        img_global[self._ys[mask_all],  self._xs[mask_all]]   = vals[mask_all]
+
+        self._im_focus.set_data(img_focus)
+        self._im_global.set_data(img_global)
+        self._rescale_heatmap_norm(img_focus, img_global)
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+    def _nice_vmax(self, x: float) -> float:
+        x = float(x)
+        if not np.isfinite(x) or x <= 0:
+            return 1.0
+        exp = np.floor(np.log10(x))
+        base = 10.0 ** exp
+        for m in (1.0, 2.0, 3.0, 5.0, 7.0, 10.0):  # a bit tighter than before
+            if x <= m * base:
+                return m * base
+        return x
+
+    def _rescale_heatmap_norm(self, img_focus: np.ndarray, img_global: np.ndarray) -> None:
+        vmax_f = float(np.nanmax(img_focus)) if np.isfinite(img_focus).any() else 1.0
+        vmax_g = float(np.nanmax(img_global)) if np.isfinite(img_global).any() else 1.0
+        self._im_focus.set_clim(0.0, self._nice_vmax(vmax_f))
+        self._im_global.set_clim(0.0, self._nice_vmax(vmax_g))
+        self._focus_cbar.update_normal(self._im_focus)
+        self._global_cbar.update_normal(self._im_global)
+
+    # ---------------- ROI overlays / zoom ----------------
+    def _apply_zoom_to_maps(self, redraw=True):
+        for ax in (self.roi_ax, self.map_ax):
+            for p in list(ax.patches):
+                p.remove()
+
+        if hasattr(self, "_last_rect"):
+            x0, y0, x1, y1 = self._last_rect
+            for ax in (self.roi_ax, self.map_ax):
+                ax.set_xlim(x0, x1)
+                ax.set_ylim(y1, y0)  # origin='upper'
+                ax.add_patch(mpl.patches.Rectangle(
+                    (x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.6,
+                    ec=(0.15, 0.15, 0.15, 1.0)))
+        else:
+            for ax in (self.roi_ax, self.map_ax):
+                ax.set_xlim(*self._map_default_xlim)
+                ax.set_ylim(*self._map_default_ylim)
+
+        if redraw:
+            self.roi_canvas.draw_idle()
+            self.map_canvas.draw_idle()
+
+    def _update_roi_overlays(self, clear_only: bool = False):
+        for attr in ("_roi_overlay_left", "_roi_overlay_right"):
+            patches = getattr(self, attr, [])
+            for p in patches:
+                try: p.remove()
+                except Exception: pass
+            setattr(self, attr, [])
+
+        if clear_only or not hasattr(self, "_last_rect"):
+            if hasattr(self, "roi_canvas"): self.roi_canvas.draw_idle()
+            if hasattr(self, "map_canvas"): self.map_canvas.draw_idle()
+            return
+
+        x0, y0, x1, y1 = self._last_rect
+
+        def _draw(ax):
+            drawn = []
+            try:
+                # focus rectangle
+                r = mpl.patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.8, ec="w")
+                ax.add_patch(r); drawn.append(r)
+                # dim outside (dark gray, subtle)
+                hatch = "////"; fc=(0,0,0,0.08); ec=(0,0,0,0.35)
+                if x0 > 0:
+                    p = mpl.patches.Rectangle((0, 0), x0, self.H, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+                if x1 < self.W:
+                    p = mpl.patches.Rectangle((x1, 0), self.W - x1, self.H, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+                if y0 > 0:
+                    p = mpl.patches.Rectangle((x0, 0), x1 - x0, y0, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+                if y1 < self.H:
+                    p = mpl.patches.Rectangle((x0, y1), x1 - x0, self.H - y1, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
+                    ax.add_patch(p); drawn.append(p)
+            except Exception:
+                pass
+            return drawn
+
+        self._roi_overlay_left  = _draw(self.roi_ax)
+        self._roi_overlay_right = _draw(self.map_ax)
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+    def _install_map_zooms(self):
+        for attr in ("_map_zoom_left", "_map_zoom_right"):
+            sel = getattr(self, attr, None)
+            if sel is not None:
+                try: sel.disconnect_events()
+                except Exception: pass
+                setattr(self, attr, None)
+
+        self._map_zoom_left = RectangleSelector(
+            self.roi_ax, lambda e0, e1, ax=self.roi_ax: self._on_map_zoom(ax, e0, e1),
+            useblit=True, button=[MouseButton.RIGHT],
+            minspanx=5, minspany=5, spancoords="data",
+            interactive=False, drag_from_anywhere=False
+        )
+        self._map_zoom_right = RectangleSelector(
+            self.map_ax, lambda e0, e1, ax=self.map_ax: self._on_map_zoom(ax, e0, e1),
+            useblit=True, button=[MouseButton.RIGHT],
+            minspanx=5, minspany=5, spancoords="data",
+            interactive=False, drag_from_anywhere=False
+        )
+
+    def _on_map_zoom(self, ax, e0, e1):
+        if e0 is None or e1 is None: return
+        if None in (e0.xdata, e1.xdata, e0.ydata, e1.ydata): return
+        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
+        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
+        def _pad(ax_, x0_, x1_, y0_, y1_):
+            if x0_ == x1_:
+                xr = ax_.get_xlim(); p = max(1e-9, 0.02*(xr[1]-xr[0])); x0_, x1_ = (x0_-p, x1_+p)
+            if y0_ == y1_:
+                yr = ax_.get_ylim(); p = max(1e-9, 0.02*abs(yr[1]-yr[0])); y0_, y1_ = (y0_-p, y1_+p)
+            return x0_, x1_, y0_, y1_
+        x0, x1, y0, y1 = _pad(ax, x0, x1, y0, y1)
+        for target_ax in (self.roi_ax, self.map_ax):
+            target_ax.set_xlim(x0, x1)
+            target_ax.set_ylim(y1, y0)
+        self._update_grids()
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+    def _maybe_reset_map_zoom(self, event):
+        if event is None or event.inaxes is None: return
+        if not (getattr(event, "dblclick", False) and event.button == MouseButton.RIGHT): return
+        if event.inaxes not in (self.roi_ax, self.map_ax): return
+        for target_ax in (self.roi_ax, self.map_ax):
+            target_ax.set_xlim(*self._map_default_xlim)
+            target_ax.set_ylim(*self._map_default_ylim)
+        self._update_grids()
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+    # ---------------- span selectors ----------------
+    def _clear_selector_visuals(self, sel):
+        if sel is None: return
+        for attr in ("_selection_artist", "_rect", "_span", "_lineleft", "_lineright", "artists", "to_draw"):
             art = getattr(sel, attr, None)
-            if art is not None:
-                try:
+            if art is None: continue
+            try:
+                if isinstance(art, (list, tuple)):
+                    for a in list(art):
+                        try: a.remove()
+                        except Exception: pass
+                else:
                     art.remove()
-                except Exception:
-                    try:
+            except Exception:
+                try:
+                    if isinstance(art, (list, tuple)):
+                        for a in art: a.set_visible(False)
+                    else:
                         art.set_visible(False)
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
     def _clear_all_selector_visuals(self):
-        """Remove all currently visible red bars/rectangles from all selectors."""
         for sel in getattr(self, "_row_span_selectors", []):
             self._clear_selector_visuals(sel)
         self._clear_selector_visuals(getattr(self, "_span_roi", None))
-        
-    # ---------------- Spectra drawing (per-row) ----------------
+
+    def _init_span_selectors(self):
+        if hasattr(self, "_span_roi") and self._span_roi is not None:
+            try: self._clear_selector_visuals(self._span_roi); self._span_roi.disconnect_events()
+            except Exception: pass
+            self._span_roi = None
+        for s in getattr(self, "_row_span_selectors", []):
+            try: self._clear_selector_visuals(s); s.disconnect_events()
+            except Exception: pass
+        self._row_span_selectors = []
+
+        for ax in self.spec_fig.axes:
+            sel = SpanSelector(
+                ax, lambda a, b: self._set_span(min(a, b), max(a, b)),
+                "horizontal", useblit=True, props=dict(alpha=0.15),
+                interactive=True, grab_range=5,
+                button=[MouseButton.LEFT], ignore_event_outside=False
+            )
+            self._row_span_selectors.append(sel)
+
+        self._span_roi = SpanSelector(
+            self.roi_spec_ax, lambda a, b: self._set_span(min(a, b), max(a, b)),
+            "horizontal", useblit=True, props=dict(alpha=0.15),
+            interactive=True, grab_range=5,
+            button=[MouseButton.LEFT], ignore_event_outside=False
+        )
+
+        if self._roi_zoom_sel is not None:
+            try: self._roi_zoom_sel.disconnect_events()
+            except Exception: pass
+        self._roi_zoom_sel = RectangleSelector(
+            self.roi_spec_ax, self._on_roi_zoom,
+            useblit=True, button=[MouseButton.RIGHT],
+            minspanx=5, minspany=5, spancoords="data",
+            interactive=False, drag_from_anywhere=False
+        )
+
+    def _hide_selector_visual(self, selector):
+        try: selector.set_visible(False)
+        except Exception: pass
+
+    def _on_span_select(self, a, b, ax_selector=None):
+        lo, hi = float(min(a, b)), float(max(a, b))
+        self._set_span(lo, hi)
+        if ax_selector is not None:
+            self._hide_selector_visual(ax_selector)
+
+    def _set_span(self, lo, hi, source="any"):
+        self._span_range = (float(lo), float(hi))
+        x, _, is_energy = self._x_axis()
+        if is_energy:
+            i0 = int(np.clip(np.searchsorted(x, lo, side="left"), 0, self.C-1))
+            i1 = int(np.clip(np.searchsorted(x, hi, side="right") - 1, 0, self.C-1))
+        else:
+            i0 = int(np.clip(np.floor(min(lo, hi)), 0, self.C-1))
+            i1 = int(np.clip(np.ceil (max(lo, hi)) - 1, 0, self.C-1))
+        if i1 < i0: i0, i1 = i1, i0
+        self._span_idx_range = (i0, i1)
+        self._clear_all_selector_visuals()
+        self.spanChanged.emit(self._span_range)
+
+    def _on_span_changed(self, span):
+        self._span_range = (float(span[0]), float(span[1]))
+        self._refresh_span_bands()
+
+    def _refresh_span_bands(self):
+        self._update_span_label()
+        self._update_heatmaps()
+        self._render_roi_spectra(update_only=True)
+        self._update_all_row_span_overlays()
+        self._update_grids()
+        for s in self._row_span_selectors:
+            self._hide_selector_visual(s)
+        if self._span_roi is not None:
+            self._hide_selector_visual(self._span_roi)
+
+    # ---------------- Spectra (fast redraw) ----------------
+    def _ensure_row_span_patch(self, ax):
+        lo, hi = self._span_lohi_in_axis_units()
+        p = getattr(ax, "_roi_span_patch", None)
+        if (p is None) or (getattr(p, "axes", None) is not ax) or (p not in ax.patches):
+            ax._roi_span_patch = ax.axvspan(
+                lo, hi, ymin=0.0, ymax=1.0,
+                transform=ax.get_xaxis_transform(),
+                color="k", alpha=0.08, zorder=0
+            )
+            return ax._roi_span_patch
+        try:
+            p.set_xy([[lo, 0.0], [lo, 1.0], [hi, 1.0], [hi, 0.0], [lo, 0.0]])
+        except Exception:
+            try: p.set_x(lo); p.set_width(hi - lo)
+            except Exception: pass
+        return p
+
+    def _update_all_row_span_overlays(self):
+        for ax in self.spec_fig.axes:
+            self._ensure_row_span_patch(ax)
+        self._ensure_roi_span_patch()
+        self.spec_canvas.draw_idle(); self.roi_spec_canvas.draw_idle()
+
     def _render_spectra_rows(self, preserve_limits: bool=False):
-        # save current limits if requested
         prev_limits = []
         if preserve_limits and self.spec_fig.axes:
-            for ax in self.spec_fig.axes:
-                prev_limits.append((ax.get_xlim(), ax.get_ylim()))
-        else:
-            prev_limits = None
+            prev_limits = [(ax.get_xlim(), ax.get_ylim()) for ax in self.spec_fig.axes]
 
-        # tear down old zoomers & span selectors (also delete their artists)
         for z in self._row_zoomers:
             try: z.disconnect_events()
             except Exception: pass
         self._row_zoomers = []
-
         for s in self._row_span_selectors:
-            try:
-                self._clear_selector_visuals(s)  # <— NEW: remove the red bars
-                s.disconnect_events()
-            except Exception:
-                pass
+            try: self._clear_selector_visuals(s); s.disconnect_events()
+            except Exception: pass
         self._row_span_selectors = []
-
         self._row_defaults = []
         self._row_span_patches = []
 
@@ -1661,19 +2101,20 @@ class SpectraRoiDialog(QDialog):
         x, xlabel, _ = self._x_axis()
         agg    = self.agg_combo.currentText()
         yscale = self.yscale.currentText()
-        pct    = self.pcfg.get("cluster_pct", {})
-        mask   = np.ones(self.N, dtype=bool)  # Spectra tab ignores rectangle ROI
+        pct    = self._cluster_pct
 
         nrows = max(1, len(self.rows))
         axs = [self.spec_fig.add_subplot(nrows, 1, i+1) for i in range(nrows)]
 
+        if agg == "sum":
+            mats = self._sum_by_cluster
+        else:
+            denom = np.maximum(1, self._cnt_by_cluster).astype(np.float32)[:, None]
+            mats = self._sum_by_cluster / denom
+
         for r, ax in enumerate(axs):
             for cid in sorted(self.rows[r]["clusters"]):
-                idx = (self.labels == cid) & mask
-                if not np.any(idx):
-                    continue
-                Y = self.spectra[idx]
-                y = np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)
+                y = mats[cid]
                 if yscale == "log": y = np.where(y <= 0, self._eps, y)
                 label = f"Cluster {cid}"
                 if self.show_pct.isChecked(): label += f"  {pct.get(int(cid), 0.0):.1f}%"
@@ -1683,30 +2124,21 @@ class SpectraRoiDialog(QDialog):
             ax.grid(True, which=("both" if yscale == "log" else "major"), alpha=0.25)
             ax.set_yscale(yscale)
             if r == nrows - 1: ax.set_xlabel(xlabel)
-
-            # force x edges to exactly data edges
             ax.set_xlim(float(x.min()), float(x.max()))
-
-            # manual Y or autorange, store defaults
             ylim = self.rows[r].get("ylim")
             if isinstance(ylim, tuple) and ylim is not None:
-                ymin, ymax = ylim
+                y0, y1 = ylim
                 if yscale == "log":
-                    ymin = max(self._eps, ymin)
-                    ymax = max(ymin * 1.001, ymax)
-                ax.set_ylim(ymin, ymax)
+                    y0 = max(self._eps, y0); y1 = max(y0*1.001, y1)
+                ax.set_ylim(y0, y1)
             else:
                 ax.relim(); ax.autoscale_view()
 
             self._row_defaults.append(((float(x.min()), float(x.max())), ax.get_ylim()))
-
             if ax.get_legend_handles_labels()[1]:
                 ax.legend(loc="best", fontsize=8)
-
-            # persistent band for this axes
             self._row_span_patches.append(self._ensure_row_span_patch(ax))
 
-        # reapply previous limits if needed
         if preserve_limits and prev_limits and len(prev_limits) == len(axs):
             for ax, (xl, yl) in zip(axs, prev_limits):
                 ax.set_xlim(*xl)
@@ -1720,7 +2152,6 @@ class SpectraRoiDialog(QDialog):
         self.spec_canvas.draw_idle()
         self._update_span_label()
 
-        # RIGHT-drag zoom for each axes
         for r, ax in enumerate(axs):
             self._row_zoomers.append(
                 RectangleSelector(
@@ -1731,7 +2162,6 @@ class SpectraRoiDialog(QDialog):
                 )
             )
 
-        # LEFT-drag span selectors for each row (non-interactive; we hide the visual right after)
         for ax in axs:
             sel = SpanSelector(
                 ax, lambda a,b, s=None: self._on_span_select(a, b, ax_selector=sel),
@@ -1740,76 +2170,10 @@ class SpectraRoiDialog(QDialog):
                 button=[MouseButton.LEFT], ignore_event_outside=False
             )
             self._row_span_selectors.append(sel)
-            
-    def _span_lohi_in_axis_units(self):
-        """
-        Return (lo, hi) for the current x-axis units (energy or channels),
-        computed from the canonical index range if available.
-        """
-        # If you've already got this helper in your class, keep a single copy.
-        if getattr(self, "_span_idx_range", None) is None:
-            # Fallback for older projects: use raw values (already in current units)
-            return getattr(self, "_span_range", None)
-        x, _, _ = self._x_axis()
-        i0, i1 = self._span_idx_range
-        i0 = max(0, min(self.C - 1, int(i0)))
-        i1 = max(0, min(self.C - 1, int(i1)))
-        lo = float(x[min(i0, i1)])
-        hi = float(x[max(i0, i1)])
-        return (lo, hi)
-
-    # persist band on a given axes
-    def _ensure_row_span_patch(self, ax):
-        lohi = self._span_lohi_in_axis_units()
-        if lohi is None:
-            if getattr(ax, "_roi_span_patch", None):
-                try: ax._roi_span_patch.remove()
-                except Exception: pass
-                ax._roi_span_patch = None
-            return None
-
-        lo, hi = lohi
-        p = getattr(ax, "_roi_span_patch", None)
-        if p is None:
-            ax._roi_span_patch = ax.axvspan(
-                lo, hi, ymin=0.0, ymax=1.0,
-                transform=ax.get_xaxis_transform(),
-                color="k", alpha=0.08, zorder=0
-            )
-            return ax._roi_span_patch
-
-        try:
-            p.set_xy([[lo, 0.0], [lo, 1.0], [hi, 1.0], [hi, 0.0], [lo, 0.0]])
-            return p
-        except Exception:
-            pass
-        try:
-            if hasattr(p, "set_x") and hasattr(p, "set_width"):
-                p.set_x(lo); p.set_width(hi - lo)
-                return p
-        except Exception:
-            pass
-
-        try: p.remove()
-        except Exception: pass
-        ax._roi_span_patch = ax.axvspan(
-            lo, hi, ymin=0.0, ymax=1.0,
-            transform=ax.get_xaxis_transform(),
-            color="k", alpha=0.08, zorder=0
-        )
-        return ax._roi_span_patch
-
-    def _update_all_row_span_overlays(self):
-        for ax in self.spec_fig.axes:
-            self._ensure_row_span_patch(ax)
-        self._ensure_roi_span_patch()
-        self.spec_canvas.draw_idle()
-        self.roi_spec_canvas.draw_idle()
 
     # RIGHT dbl-click reset (rows)
     def _maybe_reset_row_zoom(self, event):
-        if event is None or event.inaxes is None:
-            return
+        if event is None or event.inaxes is None: return
         if event.dblclick and event.button == MouseButton.RIGHT and event.inaxes in self.spec_fig.axes:
             ax = event.inaxes
             r = self.spec_fig.axes.index(ax)
@@ -1823,11 +2187,9 @@ class SpectraRoiDialog(QDialog):
             self.spec_canvas.draw_idle()
 
     def _on_row_zoom(self, r, e0, e1):
-        if r < 0 or r >= len(self.spec_fig.axes) or e0 is None or e1 is None:
-            return
+        if r < 0 or r >= len(self.spec_fig.axes) or e0 is None or e1 is None: return
         ax = self.spec_fig.axes[r]
-        if e0.xdata is None or e1.xdata is None or e0.ydata is None or e1.ydata is None:
-            return
+        if None in (e0.xdata, e1.xdata, e0.ydata, e1.ydata): return
         x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
         y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
         if x0 == x1:
@@ -1838,6 +2200,170 @@ class SpectraRoiDialog(QDialog):
             y0 = max(self._eps, y0); y1 = max(y0*1.001, y1)
         ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
         self.spec_canvas.draw_idle()
+
+    # ---------------- ROI rectangle + spectra ----------------
+    def _activate_rectangle_roi(self):
+        try:
+            if hasattr(self, "_rect_sel") and self._rect_sel is not None:
+                self._rect_sel.set_visible(False); self._rect_sel.disconnect_events()
+        except Exception:
+            pass
+
+        def _on_select(eclick, erelease):
+            if eclick is None or erelease is None: return
+            if None in (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata): return
+            x0 = int(np.floor(min(eclick.xdata, erelease.xdata)))
+            x1 = int(np.ceil (max(eclick.xdata, erelease.xdata)))
+            y0 = int(np.floor(min(eclick.ydata, erelease.ydata)))
+            y1 = int(np.ceil (max(eclick.ydata, erelease.ydata)))
+            self._last_rect = (x0, y0, x1, y1)
+
+            in_rect = (self._xs >= x0) & (self._xs <= x1) & (self._ys >= y0) & (self._ys <= y1)
+            self.current_roi_mask = in_rect
+
+            self._update_roi_overlays()
+            self._render_roi_spectra(update_only=False)
+
+        self._rect_sel = RectangleSelector(
+            self.roi_ax, _on_select,
+            useblit=True, button=[MouseButton.LEFT],
+            minspanx=2, minspany=2, spancoords="pixels",
+            interactive=False, drag_from_anywhere=False,
+        )
+
+    def _zoom_to_roi(self):
+        if not hasattr(self, "_last_rect"): return
+        x0, y0, x1, y1 = self._last_rect
+        for ax in (self.roi_ax, self.map_ax):
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y1, y0)
+        self._update_roi_overlays(clear_only=False)
+        self._update_grids()
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+
+    def _reset_roi_bars(self):
+        x, _, _ = self._x_axis()
+        lo, hi = float(x.min()), float(x.max())
+        self._set_span(lo, hi)
+        self._update_all_row_span_overlays()
+
+    def _clear_roi(self):
+        self.current_roi_mask = np.ones(self.N, dtype=bool)
+        if hasattr(self, "_last_rect"): delattr(self, "_last_rect")
+        self._clear_all_selector_visuals()
+        self._update_roi_overlays(clear_only=True)
+        for ax in (self.roi_ax, self.map_ax):
+            ax.set_xlim(*self._map_default_xlim)
+            ax.set_ylim(*self._map_default_ylim)
+        self._update_grids()
+        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
+        self._render_roi_spectra(update_only=False)
+        self._update_all_row_span_overlays()
+
+    def _ensure_roi_span_patch(self):
+        ax = self.roi_spec_ax
+        lo, hi = self._span_lohi_in_axis_units()
+        p = getattr(self, "_roi_span_patch", None)
+        if (p is None) or (getattr(p, "axes", None) is not ax) or (p not in ax.patches):
+            self._roi_span_patch = ax.axvspan(
+                lo, hi, ymin=0.0, ymax=1.0,
+                transform=ax.get_xaxis_transform(),
+                color="k", alpha=0.08, zorder=0
+            )
+            return self._roi_span_patch
+        try:
+            p.set_xy([[lo, 0.0], [lo, 1.0], [hi, 1.0], [hi, 0.0], [lo, 0.0]]); return p
+        except Exception:
+            try: p.set_x(lo); p.set_width(hi - lo); return p
+            except Exception: pass
+        try: p.remove()
+        except Exception: pass
+        self._roi_span_patch = ax.axvspan(
+            lo, hi, ymin=0.0, ymax=1.0, transform=ax.get_xaxis_transform(),
+            color="k", alpha=0.08, zorder=0
+        )
+        return self._roi_span_patch
+
+    def _render_roi_spectra(self, update_only=False):
+        if not update_only:
+            self.roi_spec_ax.clear()
+            self._roi_span_patch = None
+
+        colors = self._get_cluster_colors()
+        x, xlabel, _ = self._x_axis()
+        agg    = self.agg_combo.currentText()
+        yscale = self.yscale.currentText()
+        mask   = self.current_roi_mask
+        keep   = {i for i, cb in enumerate(self.cluster_checks) if cb.isChecked()}
+
+        if not update_only:
+            roi_idx = np.flatnonzero(mask)
+            roi_set = set(roi_idx)
+            for cid in sorted(keep):
+                idx_c = self._idx_by_cluster[cid]
+                if idx_c.size == 0: continue
+                sel = [i for i in idx_c if i in roi_set]
+                if not sel: continue
+                Y = self.spectra[np.asarray(sel, dtype=np.int32)]
+                y = (np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)).astype(np.float32, copy=False)
+                if yscale == "log":
+                    y = np.where(y <= 0, self._eps, y)
+                self.roi_spec_ax.plot(x, y, color=colors[cid], lw=1.1, label=f"Cluster {cid}")
+            self.roi_spec_ax.set_xlabel(xlabel)
+            self.roi_spec_ax.set_ylabel("Intensity" if agg == "mean" else "Counts (sum)")
+            self.roi_spec_ax.set_yscale(yscale)
+            self.roi_spec_ax.grid(True, which=("both" if yscale=="log" else "major"), alpha=0.25)
+            self.roi_spec_ax.set_xlim(float(x.min()), float(x.max()))
+            if self.roi_spec_ax.get_legend_handles_labels()[1]:
+                self.roi_spec_ax.legend(loc="best", fontsize=8)
+
+        self._ensure_roi_span_patch()
+        self.roi_spec_canvas.draw_idle()
+
+        if not hasattr(self, "_roi_default_xlim"):
+            self._roi_default_xlim = (float(x.min()), float(x.max()))
+        if not hasattr(self, "_roi_default_ylim"):
+            self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
+            self._roi_default_ylim = self.roi_spec_ax.get_ylim()
+
+    def _on_roi_zoom(self, e0, e1):
+        if e0 is None or e1 is None or e0.xdata is None or e1.xdata is None or e0.ydata is None or e1.ydata is None:
+            return
+        ax = self.roi_spec_ax
+        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
+        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
+        if x0 == x1:
+            xr = ax.get_xlim(); pad = max(1e-9, 0.02*(xr[1]-xr[0])); x0, x1 = (x0-pad, x1+pad)
+        if y0 == y1:
+            yr = ax.get_ylim(); pad = max(1e-12, 0.02*abs(yr[1]-yr[0])); y0, y1 = (y0-pad, y1+pad)
+        if self.yscale.currentText() == "log":
+            y0 = max(self._eps, y0); y1 = max(y0*1.001, y1)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        self.roi_spec_canvas.draw_idle()
+
+    def _maybe_reset_roi_zoom(self, event):
+        if event is None or event.inaxes is None: return
+        if event.inaxes is self.roi_spec_ax and event.dblclick and event.button == MouseButton.RIGHT:
+            try:
+                if self._roi_zoom_sel is not None:
+                    self._roi_zoom_sel.set_active(False)
+            except Exception:
+                pass
+            x, _, _ = self._x_axis()
+            if not hasattr(self, "_roi_default_xlim"):
+                self._roi_default_xlim = (float(x.min()), float(x.max()))
+            if not hasattr(self, "_roi_default_ylim"):
+                self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
+                self._roi_default_ylim = self.roi_spec_ax.get_ylim()
+            self.roi_spec_ax.set_xlim(*self._roi_default_xlim)
+            self.roi_spec_ax.set_ylim(*self._roi_default_ylim)
+            if self.yscale.currentText() == "log":
+                lo, hi = self.roi_spec_ax.get_ylim()
+                lo = max(self._eps, lo); hi = max(lo * 1.001, hi)
+                self.roi_spec_ax.set_ylim(lo, hi)
+            self.roi_spec_canvas.draw_idle()
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self._roi_zoom_sel and self._roi_zoom_sel.set_active(True))
 
     # ---------------- Row editing ----------------
     def _add_row(self):
@@ -1864,21 +2390,20 @@ class SpectraRoiDialog(QDialog):
     def _auto_limits_for_row(self, r):
         agg    = self.agg_combo.currentText()
         yscale = self.yscale.currentText()
-        mask = np.ones(self.N, dtype=bool)  # Spectra tab ignores rectangle ROI
+        if agg == "sum":
+            mats = self._sum_by_cluster
+        else:
+            denom = np.maximum(1, self._cnt_by_cluster).astype(np.float32)[:, None]
+            mats = self._sum_by_cluster / denom
         ymin, ymax = np.inf, -np.inf
         for cid in self.rows[r]["clusters"]:
-            idx = (self.labels == cid) & mask
-            if not np.any(idx): continue
-            Y = self.spectra[idx]
-            y = np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)
+            y = mats[cid]
             if yscale == "log": y = np.where(y <= 0, self._eps, y)
-            ymin = min(ymin, float(np.nanmin(y)))
-            ymax = max(ymax, float(np.nanmax(y)))
+            ymin = min(ymin, float(np.nanmin(y))); ymax = max(ymax, float(np.nanmax(y)))
         if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
             ymin, ymax = (self._eps if yscale=="log" else 0.0, 1.0)
         if yscale == "log":
-            ymin = max(self._eps, ymin)
-            ymax = max(ymin*1.001, ymax)
+            ymin = max(self._eps, ymin); ymax = max(ymin*1.001, ymax)
         return ymin, ymax
 
     def _edit_row_dialog(self):
@@ -1943,606 +2468,124 @@ class SpectraRoiDialog(QDialog):
         btns.rejected.connect(dlg.reject)
         dlg.exec()
 
-    # ---------------- span selectors ----------------
-    def _init_span_selectors(self):
-        # Kill previous ROI selector artists (red bars) but keep it active
-        if hasattr(self, "_span_roi") and self._span_roi is not None:
-            try:
-                self._clear_selector_visuals(self._span_roi)
-                self._span_roi.disconnect_events()
-            except Exception:
-                pass
-            self._span_roi = None
+    # ---------------- Grid controls ----------------
+    def _on_grid_mode_changed(self, *_):
+        self._sync_grid_controls_visibility()
+        self._update_grids()
 
-        # Kill row selectors & their artists
-        for s in getattr(self, "_row_span_selectors", []):
-            try:
-                self._clear_selector_visuals(s)
-                s.disconnect_events()
-            except Exception:
-                pass
-        self._row_span_selectors = []
+    def _sync_grid_controls_visibility(self):
+        is_manual = (self.grid_mode.currentText() == "Manual")
+        # show α and ≥px only in Manual
+        for w in (self.grid_alpha_label, self.grid_alpha, self.grid_px_label, self.grid_min_px):
+            w.setVisible(is_manual)
 
-        # Install LEFT-drag span selectors on every spectra row
-        for ax in self.spec_fig.axes:
-            sel = SpanSelector(
-                ax, lambda a, b: self._set_span(min(a, b), max(a, b)),
-                "horizontal", useblit=True, props=dict(alpha=0.15),
-                interactive=True, grab_range=5,
-                button=[MouseButton.LEFT], ignore_event_outside=False
-            )
-            self._row_span_selectors.append(sel)
-
-        # ROI tab bottom spectra (LEFT-drag)
-        self._span_roi = SpanSelector(
-            self.roi_spec_ax, lambda a, b: self._set_span(min(a, b), max(a, b)),
-            "horizontal", useblit=True, props=dict(alpha=0.15),
-            interactive=True, grab_range=5,
-            button=[MouseButton.LEFT], ignore_event_outside=False
-        )
-
-        # ROI spectra RIGHT-drag zoomer
-        if self._roi_zoom_sel is not None:
-            try: self._roi_zoom_sel.disconnect_events()
+    def _clear_grid_lines(self, ax, attr_name):
+        lines = getattr(self, attr_name, [])
+        for ln in lines:
+            try: ln.remove()
             except Exception: pass
-        self._roi_zoom_sel = RectangleSelector(
-            self.roi_spec_ax, self._on_roi_zoom,
-            useblit=True, button=[MouseButton.RIGHT],
-            minspanx=5, minspany=5, spancoords="data",
-            interactive=False, drag_from_anywhere=False
-        )
+        setattr(self, attr_name, [])
 
-    def _hide_selector_visual(self, selector):
-        """Hide the transient red handles/rectangle drawn by a SpanSelector."""
+    def _auto_step_from_view(self, ax, target_lines=8):
+        # choose integer step close to view_size / target_lines
+        x0, x1 = ax.get_xlim(); y1, y0 = ax.get_ylim()  # note inverted y
+        w = max(1.0, abs(x1 - x0)); h = max(1.0, abs(y1 - y0))
+        desired = max(1.0, min(w, h) / float(target_lines))
+        candidates = np.array([1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 256])
+        step = int(candidates[np.argmin(np.abs(candidates - desired))])
+        return max(1, step)
+
+    def _draw_grid_on_ax(self, ax, attr_name):
+        """Draw modular integer gridlines + integer tick labels."""
+        mode = self.grid_mode.currentText()
+        # turn axes on/off and ticks visibility
+        if mode == "Off":
+            ax.axis("off")
+            self._clear_grid_lines(ax, attr_name)
+            return
+
+        # axis ON with integer ticks
+        ax.axis("on")
+        ax.tick_params(labelsize=8)
+        # Choose step
+        if mode == "Manual":
+            step = int(max(1, self.grid_min_px.value()))
+        else:  # Auto
+            step = self._auto_step_from_view(ax)
+
+        # compute integer lines in current view
+        x0, x1 = ax.get_xlim(); y1, y0 = ax.get_ylim()  # y inverted (upper origin)
+        lo_x = int(np.floor(min(x0, x1))); hi_x = int(np.ceil(max(x0, x1)))
+        lo_y = int(np.floor(min(y0, y1))); hi_y = int(np.ceil(max(y0, y1)))
+
+        xs = np.arange((lo_x // step) * step, hi_x + 1, step, dtype=int)
+        ys = np.arange((lo_y // step) * step, hi_y + 1, step, dtype=int)
+
+        # integer ticks at the same positions (labels are plain ints)
+        ax.set_xticks(xs)
+        ax.set_yticks(ys)
+
+        # remove old lines then draw new ones
+        self._clear_grid_lines(ax, attr_name)
+        alpha = float(self.grid_alpha.value()) if mode == "Manual" else 0.20
+        color = (1.0, 1.0, 1.0, alpha)
+        lns = []
+        for xv in xs:
+            ln, = ax.plot([xv, xv], [y0, y1], lw=0.8, color=color, zorder=5)
+            lns.append(ln)
+        for yv in ys:
+            ln, = ax.plot([x0, x1], [yv, yv], lw=0.8, color=color, zorder=5)
+            lns.append(ln)
+        setattr(self, attr_name, lns)
+
+    def _update_grids(self):
+        """Redraw gridlines & toggle tick labels according to the current mode."""
         try:
-            selector.set_visible(False)
+            self._draw_grid_on_ax(self.roi_ax, "_grid_lines_left")
+            self._draw_grid_on_ax(self.map_ax, "_grid_lines_right")
         except Exception:
             pass
-
-    def _on_span_select(self, a, b, ax_selector=None):
-        lo, hi = float(min(a, b)), float(max(a, b))
-        self._set_span(lo, hi)
-        if ax_selector is not None:
-            self._hide_selector_visual(ax_selector)  # remove the red handles immediately
-        # patches get updated via spanChanged → _on_span_changed
-
-    def _set_span(self, lo, hi, source="any"):
-        # Always keep the original values around (for backwards compat/UI), but
-        # canonically persist the selection in INDEX space.
-        self._span_range = (float(lo), float(hi))
-
-        # Compute index bounds under current axis mapping
-        x, _, is_energy = self._x_axis()
-        if is_energy:
-            # map energy → nearest channel indices
-            i0 = int(np.argmin(np.abs(x - float(lo))))
-            i1 = int(np.argmin(np.abs(x - float(hi))))
-        else:
-            i0 = int(np.floor(min(lo, hi)))
-            i1 = int(np.ceil (max(lo, hi)))
-
-        i0 = max(0, min(self.C - 1, i0))
-        i1 = max(0, min(self.C - 1, i1))
-        self._span_idx_range = (min(i0, i1), max(i0, i1))
-
-        # Hide transient selector visuals so only the persistent grey band remains
-        self._clear_all_selector_visuals()
-        self.spanChanged.emit(self._span_range)
-
-    def _on_span_changed(self, span):
-        self._span_range = (float(span[0]), float(span[1]))
-        self._refresh_span_bands()
-
-    def _refresh_span_bands(self):
-        self._update_span_label()
-        self._update_heatmaps()
-        self._render_roi_spectra(update_only=True)
-        self._update_all_row_span_overlays()
-        # also ensure any transient selector visuals are hidden
-        for s in self._row_span_selectors:
-            self._hide_selector_visual(s)
-        if self._span_roi is not None:
-            self._hide_selector_visual(self._span_roi)
-
-    def _update_span_label(self):
-        if self._span_idx_range is None and self._span_range is None:
-            self.span_info.setText("Selected range: (LEFT-drag on any row or ROI spectra)")
-            return
-        x, _, is_energy = self._x_axis()
-
-        if self._span_idx_range is not None:
-            i0, i1 = self._span_idx_range
-            i0 = max(0, min(self.C - 1, int(i0)))
-            i1 = max(0, min(self.C - 1, int(i1)))
-            lo = float(x[min(i0, i1)])
-            hi = float(x[max(i0, i1)])
-        else:
-            # fallback for old sessions
-            lo, hi = self._span_range
-            lo = max(float(x.min()), min(float(x.max()), lo))
-            hi = max(float(x.min()), min(float(x.max()), hi))
-
-        if is_energy:
-            self.span_info.setText(f"Selected range: {lo:.4g} – {hi:.4g} keV")
-        else:
-            self.span_info.setText(f"Selected range: {int(round(lo))} – {int(round(hi))} channels")
-
-    # ---------------- ROI (rectangle + heatmaps + spectra) ----------------
-    def _build_cluster_image(self):
-        xs = self.xy["X"].astype(int).to_numpy()
-        ys = self.xy["Y"].astype(int).to_numpy()
-        W = int(xs.max()) + 1; H = int(ys.max()) + 1
-        rgba = self._get_cluster_colors()
-        img = np.ones((H, W, 4), dtype=float); img[..., 3] = 0.0
-        for i, (x, y) in enumerate(zip(xs, ys)):
-            lbl = int(self.labels[i])
-            if 0 <= x < W and 0 <= y < H:
-                img[y, x] = rgba[lbl]
-        return img
-
-    def _heatmap_array(self, keep_clusters=None):
-        idx_cols = self._current_span_indices()
-        xs = self.xy["X"].astype(int).to_numpy()
-        ys = self.xy["Y"].astype(int).to_numpy()
-        W = int(xs.max()) + 1; H = int(ys.max()) + 1
-        img = np.zeros((H, W), dtype=float)
-
-        if keep_clusters is None:
-            mask = np.ones(self.N, dtype=bool)
-        else:
-            mask = np.isin(self.labels, list(keep_clusters))
-
-        if np.any(mask):
-            vals = self.spectra[mask][:, idx_cols].sum(axis=1)
-            img[ys[mask], xs[mask]] = vals
-        return img
-
-    def _apply_zoom_to_maps(self, redraw=True):
-        H, W, _ = self._cluster_rgba_img.shape
-        for ax in (self.roi_ax, self.map_ax):
-            for p in list(ax.patches):
-                p.remove()
-
-        if hasattr(self, "_last_rect"):
-            x0, y0, x1, y1 = self._last_rect
-            for ax in (self.roi_ax, self.map_ax):
-                ax.set_xlim(x0, x1)
-                ax.set_ylim(y1, y0)  # imshow origin='upper'
-                ax.add_patch(mpl.patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.4))
-        else:
-            for ax in (self.roi_ax, self.map_ax):
-                ax.set_xlim(0, W - 1)
-                ax.set_ylim(H - 1, 0)
-
-        if redraw:
-            self.roi_canvas.draw_idle()
-            self.map_canvas.draw_idle()
-
-    def _update_roi_overlays(self, clear_only: bool = False):
-        """Draw/clear ROI overlays (focus rect + hatched dimming outside)."""
-        # track and remove previous overlays safely
-        for attr in ("_roi_overlay_left", "_roi_overlay_right"):
-            patches = getattr(self, attr, [])
-            for p in patches:
-                try: p.remove()
-                except Exception: pass
-            setattr(self, attr, [])
-
-        if clear_only or not hasattr(self, "_last_rect"):
-            # nothing else to draw
-            if hasattr(self, "roi_canvas"): self.roi_canvas.draw_idle()
-            if hasattr(self, "map_canvas"): self.map_canvas.draw_idle()
-            return
-
-        x0, y0, x1, y1 = self._last_rect
-        H, W, _ = self._cluster_rgba_img.shape
-
-        def _draw(ax):
-            drawn = []
-            # focus rectangle (thin white outline)
-            try:
-                r = mpl.patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.6, ec="w")
-                ax.add_patch(r); drawn.append(r)
-            except Exception:
-                pass
-            # four “outside” rectangles with a light hatch + translucent fill
-            try:
-                hatch = "////"
-                fc = (0, 0, 0, 0.06)  # subtle dim
-                ec = (0, 0, 0, 0.15)
-                # left
-                if x0 > 0:
-                    p = mpl.patches.Rectangle((0, 0), x0, H, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
-                    ax.add_patch(p); drawn.append(p)
-                # right
-                if x1 < W:
-                    p = mpl.patches.Rectangle((x1, 0), W - x1, H, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
-                    ax.add_patch(p); drawn.append(p)
-                # top
-                if y0 > 0:
-                    p = mpl.patches.Rectangle((x0, 0), x1 - x0, y0, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
-                    ax.add_patch(p); drawn.append(p)
-                # bottom
-                if y1 < H:
-                    p = mpl.patches.Rectangle((x0, y1), x1 - x0, H - y1, facecolor=fc, edgecolor=ec, hatch=hatch, lw=0)
-                    ax.add_patch(p); drawn.append(p)
-            except Exception:
-                pass
-            return drawn
-
-        self._roi_overlay_left  = _draw(self.roi_ax)
-        self._roi_overlay_right = _draw(self.map_ax)
         self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
 
-
-    def _install_map_zooms(self):
-        """Right-drag zoom on both heatmaps."""
-        # disconnect previous
-        for attr in ("_map_zoom_left", "_map_zoom_right"):
-            sel = getattr(self, attr, None)
-            if sel is not None:
-                try: sel.disconnect_events()
-                except Exception: pass
-                setattr(self, attr, None)
-
-        self._map_zoom_left = RectangleSelector(
-            self.roi_ax, lambda e0, e1, ax=self.roi_ax: self._on_map_zoom(ax, e0, e1),
-            useblit=True, button=[MouseButton.RIGHT],
-            minspanx=5, minspany=5, spancoords="data",
-            interactive=False, drag_from_anywhere=False
-        )
-        self._map_zoom_right = RectangleSelector(
-            self.map_ax, lambda e0, e1, ax=self.map_ax: self._on_map_zoom(ax, e0, e1),
-            useblit=True, button=[MouseButton.RIGHT],
-            minspanx=5, minspany=5, spancoords="data",
-            interactive=False, drag_from_anywhere=False
-        )
-
-    def _on_map_zoom(self, ax, e0, e1):
-        """Right-drag rectangle zoom: apply to BOTH heatmaps (origin='upper')."""
-        if e0 is None or e1 is None: 
+    # ---------------- Hover (ultra light) ----------------
+    def _toggle_hover(self, checked: bool):
+        for canvas, cid in list(self._hover_cids):
+            try: canvas.mpl_disconnect(cid)
+            except Exception: pass
+        self._hover_cids = []
+        if not checked:
+            self.hover_status.setText("x=– y=– | L=– | en=– all=–")
             return
-        if None in (e0.xdata, e1.xdata, e0.ydata, e1.ydata):
+        self._hover_cids = [
+            (self.roi_canvas,  self.roi_canvas.mpl_connect("motion_notify_event", self._on_hover)),
+            (self.map_canvas,  self.map_canvas.mpl_connect("motion_notify_event", self._on_hover)),
+        ]
+
+    def _on_hover(self, event):
+        if event is None or event.inaxes not in (self.roi_ax, self.map_ax):
             return
-
-        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
-        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
-
-        # pad degenerate selections
-        def _pad_if_needed(ax_, x0_, x1_, y0_, y1_):
-            if x0_ == x1_:
-                xr = ax_.get_xlim(); pad = max(1e-9, 0.02*(xr[1]-xr[0])); x0_, x1_ = (x0_ - pad, x1_ + pad)
-            if y0_ == y1_:
-                yr = ax_.get_ylim(); pad = max(1e-9, 0.02*abs(yr[1]-yr[0])); y0_, y1_ = (y0_ - pad, y1_ + pad)
-            return x0_, x1_, y0_, y1_
-
-        x0, x1, y0, y1 = _pad_if_needed(ax, x0, x1, y0, y1)
-
-        # Apply to BOTH heatmaps; y is inverted for imshow(origin='upper')
-        for target_ax in (self.roi_ax, self.map_ax):
-            target_ax.set_xlim(x0, x1)
-            target_ax.set_ylim(y1, y0)
-
-        self.roi_canvas.draw_idle()
-        self.map_canvas.draw_idle()
-
-    def _maybe_reset_map_zoom(self, event):
-        """Double-right-click on either heatmap resets BOTH to default extents."""
-        if event is None or event.inaxes is None:
+        if event.xdata is None or event.ydata is None:
             return
-        if not (getattr(event, "dblclick", False) and event.button == MouseButton.RIGHT):
-            return
-        if event.inaxes not in (self.roi_ax, self.map_ax):
-            return
-
-        # Defaults are stored on each draw; compute if missing
-        if not hasattr(self, "_map_default_xlim") or not hasattr(self, "_map_default_ylim"):
-            H, W, _ = self._cluster_rgba_img.shape
-            self._map_default_xlim = (0, W - 1)
-            self._map_default_ylim = (H - 1, 0)
-
-        for target_ax in (self.roi_ax, self.map_ax):
-            target_ax.set_xlim(*self._map_default_xlim)
-            target_ax.set_ylim(*self._map_default_ylim)
-
-        self.roi_canvas.draw_idle()
-        self.map_canvas.draw_idle()
-
-    def _update_heatmaps(self):
+        ix = int(np.clip(np.rint(event.xdata), 0, self.W - 1))
+        iy = int(np.clip(np.rint(event.ydata), 0, self.H - 1))
+        lab = -1
+        try:
+            ridx = int(self._index_grid[iy, ix])
+            if ridx >= 0:
+                lab = int(self.labels[ridx])
+        except Exception:
+            pass
+        try:
+            val_en  = float(self._im_focus.get_array()[iy, ix])
+            val_all = float(self._im_global.get_array()[iy, ix])
+        except Exception:
+            val_en = val_all = float("nan")
         keep = {i for i, cb in enumerate(self.cluster_checks) if cb.isChecked()}
-        img_focus  = self._heatmap_array(keep_clusters=keep)
-        img_global = self._heatmap_array(keep_clusters=None)
-
-        self.roi_ax.clear()
-        im1 = self.roi_ax.imshow(img_focus, cmap="inferno")
-        self.roi_ax.set_title("Heatmap (enabled clusters)"); self.roi_ax.axis("off")
-
-        self.map_ax.clear()
-        im2 = self.map_ax.imshow(img_global, cmap="inferno")
-        self.map_ax.set_title("Heatmap (all clusters)"); self.map_ax.axis("off")
-
-        for attr in ("_focus_cbar", "_global_cbar"):
-            if hasattr(self, attr) and getattr(self, attr):
-                try: getattr(self, attr).remove()
-                except Exception: pass
-                setattr(self, attr, None)
-
-        self._focus_cbar  = self.roi_fig.colorbar(im1, ax=self.roi_ax, fraction=0.046, pad=0.03)
-        self._global_cbar = self.map_fig.colorbar(im2, ax=self.map_ax, fraction=0.046, pad=0.03)
-
-        # self._apply_zoom_to_maps(redraw=False)
-        self.roi_canvas.draw_idle(); self.map_canvas.draw_idle()
-
-        # --- NEW: remember default extents for heatmap unzoom ---
-        H, W, _ = self._cluster_rgba_img.shape
-        self._map_default_xlim = (0, W - 1)
-        self._map_default_ylim = (H - 1, 0)  # origin='upper'
-
-        # --- NEW: re-apply ROI overlays after clearing axes ---
-        self._update_roi_overlays()
-
-    def _activate_rectangle_roi(self):
-        try:
-            if hasattr(self, "_rect_sel") and self._rect_sel is not None:
-                self._rect_sel.set_visible(False); self._rect_sel.disconnect_events()
-        except Exception:
-            pass
-
-        def _on_select(eclick, erelease):
-            if eclick is None or erelease is None: return
-            if None in (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata): return
-            x0 = int(np.floor(min(eclick.xdata, erelease.xdata)))
-            x1 = int(np.ceil (max(eclick.xdata, erelease.xdata)))
-            y0 = int(np.floor(min(eclick.ydata, erelease.ydata)))
-            y1 = int(np.ceil (max(eclick.ydata, erelease.ydata)))
-            self._last_rect = (x0, y0, x1, y1)
-
-            xs = self.xy["X"].to_numpy(); ys = self.xy["Y"].to_numpy()
-            in_rect = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
-            self.current_roi_mask = in_rect
-
-            # Do NOT zoom; just update overlays + spectra/rows
-            self._update_roi_overlays()
-            self._render_roi_spectra(update_only=False)
-            # self._render_spectra_rows(preserve_limits=True)
-
-        self._rect_sel = RectangleSelector(
-            self.roi_ax, _on_select,
-            useblit=True, button=[MouseButton.LEFT],
-            minspanx=2, minspany=2, spancoords="pixels",
-            interactive=False, drag_from_anywhere=False,
+        enabled = (lab in keep)
+        self.hover_status.setText(
+            f"x={ix:>4d} y={iy:>4d} | L={lab:>3d} | en={val_en:.0f} all={val_all:.0f}"
+            + ("  (enabled)" if enabled else "")
         )
-
-    def _clear_roi(self):
-        """Clear the pixel ROI + focus overlays and UNZOOM the heatmaps to defaults.
-        Does NOT touch the ROI channel 'shadow' bands."""
-        self.current_roi_mask = np.ones(self.N, dtype=bool)
-        if hasattr(self, "_last_rect"):
-            delattr(self, "_last_rect")
-
-        self._clear_all_selector_visuals()
-        self._update_roi_overlays(clear_only=True)
-
-        self._update_heatmaps()
-
-        if not hasattr(self, "_map_default_xlim") or not hasattr(self, "_map_default_ylim"):
-            H, W, _ = self._cluster_rgba_img.shape
-            self._map_default_xlim = (0, W - 1)
-            self._map_default_ylim = (H - 1, 0)
-        for ax in (self.roi_ax, self.map_ax):
-            ax.set_xlim(*self._map_default_xlim)
-            ax.set_ylim(*self._map_default_ylim)
-        self.roi_canvas.draw_idle()
-        self.map_canvas.draw_idle()
-
-        self._render_roi_spectra(update_only=False)
-        self._update_all_row_span_overlays()
-
-    def _current_span_indices(self):
-        # Use canonical index range if available
-        if self._span_idx_range is not None:
-            i0, i1 = self._span_idx_range
-            i0 = max(0, min(self.C - 1, int(i0)))
-            i1 = max(0, min(self.C - 1, int(i1)))
-            lo, hi = (min(i0, i1), max(i0, i1))
-            return np.arange(lo, hi + 1)
-
-        # Fallback to old behavior if no index span is stored yet
-        x, _, is_energy = self._x_axis()
-        if self._span_range is None:
-            return np.arange(self.C)
-        lo, hi = self._span_range
-        if is_energy:
-            return np.where((x >= lo) & (x <= hi))[0]
-        a = int(np.floor(min(lo, hi))); b = int(np.ceil(max(lo, hi)))
-        a = max(0, min(self.C - 1, a)); b = max(0, min(self.C - 1, b))
-        return np.arange(min(a, b), max(a, b) + 1)
-
-    # ---------------- ROI bottom spectra ----------------
-    def _ensure_roi_span_patch(self):
-        """
-        Ensure the persistent gray band on the ROI-spectra (bottom) axis matches
-        the current span, recreating it if the axes were cleared or changed.
-        """
-        ax = self.roi_spec_ax
-        lohi = self._span_lohi_in_axis_units()
-        if lohi is None:
-            # No span selected: remove any stale patch
-            p = getattr(self, "_roi_span_patch", None)
-            if p is not None:
-                try: p.remove()
-                except Exception: pass
-            self._roi_span_patch = None
-            return None
-
-        lo, hi = lohi
-        p = getattr(self, "_roi_span_patch", None)
-
-        # If we don't have a patch yet, or the old patch was detached by ax.clear(),
-        # recreate a fresh one.
-        if (p is None) or (getattr(p, "axes", None) is not ax) or (p not in ax.patches):
-            self._roi_span_patch = ax.axvspan(
-                lo, hi, ymin=0.0, ymax=1.0,
-                transform=ax.get_xaxis_transform(),
-                color="k", alpha=0.08, zorder=0
-            )
-            return self._roi_span_patch
-
-        # Try to update in place
-        try:
-            p.set_xy([[lo, 0.0], [lo, 1.0], [hi, 1.0], [hi, 0.0], [lo, 0.0]])
-            return p
-        except Exception:
-            pass
-        try:
-            if hasattr(p, "set_x") and hasattr(p, "set_width"):
-                p.set_x(lo); p.set_width(hi - lo)
-                return p
-        except Exception:
-            pass
-
-        # Fallback: recreate
-        try: p.remove()
-        except Exception: pass
-        self._roi_span_patch = ax.axvspan(
-            lo, hi, ymin=0.0, ymax=1.0,
-            transform=ax.get_xaxis_transform(),
-            color="k", alpha=0.08, zorder=0
-        )
-        return self._roi_span_patch
-
-    def _render_roi_spectra(self, update_only=False):
-        """
-        Draw (or update) the spectra at the bottom of the ROI tab. If we clear the
-        axes, we invalidate the stored patch so it will be recreated on this axes.
-        """
-        if not update_only:
-            self.roi_spec_ax.clear()
-            # IMPORTANT: invalidate the old patch because ax.clear() detached it.
-            self._roi_span_patch = None
-
-        colors = self._get_cluster_colors()
-        x, xlabel, _ = self._x_axis()
-        agg    = self.agg_combo.currentText()
-        yscale = self.yscale.currentText()
-        mask   = self.current_roi_mask
-        keep = {i for i, cb in enumerate(self.cluster_checks) if cb.isChecked()}
-
-        if not update_only:
-            for cid in sorted(keep):
-                idx = (self.labels == cid) & mask
-                if not np.any(idx): 
-                    continue
-                Y = self.spectra[idx]
-                y = np.nanmean(Y, axis=0) if agg == "mean" else np.nansum(Y, axis=0)
-                if yscale == "log": 
-                    y = np.where(y <= 0, self._eps, y)
-                self.roi_spec_ax.plot(x, y, color=colors[cid], lw=1.1, label=f"Cluster {cid}")
-            self.roi_spec_ax.set_xlabel(xlabel)
-            self.roi_spec_ax.set_ylabel("Intensity" if agg == "mean" else "Counts (sum)")
-            self.roi_spec_ax.set_yscale(yscale)
-            self.roi_spec_ax.grid(True, which=("both" if yscale=="log" else "major"), alpha=0.25)
-            # keep x edges exact
-            self.roi_spec_ax.set_xlim(float(x.min()), float(x.max()))
-            if self.roi_spec_ax.get_legend_handles_labels()[1]:
-                self.roi_spec_ax.legend(loc="best", fontsize=8)
-
-        # Always (re)ensure the band AFTER any axis changes
-        self._ensure_roi_span_patch()
-        self.roi_spec_canvas.draw_idle()
-
-        # Remember defaults once (for dbl-click reset)
-        if not hasattr(self, "_roi_default_xlim"):
-            self._roi_default_xlim = (float(x.min()), float(x.max()))
-        if not hasattr(self, "_roi_default_ylim"):
-            self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
-            self._roi_default_ylim = self.roi_spec_ax.get_ylim()
-        
-    # ROI spectra zoom handlers
-    def _on_roi_zoom(self, e0, e1):
-        if e0 is None or e1 is None or e0.xdata is None or e1.xdata is None or e0.ydata is None or e1.ydata is None:
-            return
-        ax = self.roi_spec_ax
-        x0, x1 = float(min(e0.xdata, e1.xdata)), float(max(e0.xdata, e1.xdata))
-        y0, y1 = float(min(e0.ydata, e1.ydata)), float(max(e0.ydata, e1.ydata))
-        if x0 == x1:
-            xr = ax.get_xlim(); pad = max(1e-9, 0.02*(xr[1]-xr[0])); x0, x1 = (x0-pad, x1+pad)
-        if y0 == y1:
-            yr = ax.get_ylim(); pad = max(1e-12, 0.02*abs(yr[1]-yr[0])); y0, y1 = (y0-pad, y1+pad)
-        if self.yscale.currentText() == "log":
-            y0 = max(self._eps, y0); y1 = max(y0*1.001, y1)
-        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
-        self.roi_spec_canvas.draw_idle()
-
-    def _reset_roi_spec_zoom(self):
-        """Reset ROI spectra axes limits to full X and autorange Y."""
-        x, _, _ = self._x_axis()
-        self.roi_spec_ax.set_xlim(float(x.min()), float(x.max()))
-        self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
-        self.roi_spec_canvas.draw_idle()
-
-    def _maybe_reset_roi_zoom(self, event):
-        if event is None or event.inaxes is None:
-            return
-        if event.inaxes is self.roi_spec_ax and event.dblclick and event.button == MouseButton.RIGHT:
-            # Temporarily disable the right-drag zoomer to avoid conflicts with the dblclick
-            try:
-                if self._roi_zoom_sel is not None:
-                    self._roi_zoom_sel.set_active(False)
-            except Exception:
-                pass
-
-            # Make sure we have stored defaults (done on first draw in _render_roi_spectra)
-            x, _, _ = self._x_axis()
-            if not hasattr(self, "_roi_default_xlim"):
-                self._roi_default_xlim = (float(x.min()), float(x.max()))
-            if not hasattr(self, "_roi_default_ylim"):
-                self.roi_spec_ax.relim(); self.roi_spec_ax.autoscale_view()
-                self._roi_default_ylim = self.roi_spec_ax.get_ylim()
-
-            # Restore BOTH X and Y to true defaults (no fresh autoscale)
-            self.roi_spec_ax.set_xlim(*self._roi_default_xlim)
-            self.roi_spec_ax.set_ylim(*self._roi_default_ylim)
-
-            # Ensure log constraints if needed
-            if self.yscale.currentText() == "log":
-                lo, hi = self.roi_spec_ax.get_ylim()
-                lo = max(self._eps, lo); hi = max(lo * 1.001, hi)
-                self.roi_spec_ax.set_ylim(lo, hi)
-
-            self.roi_spec_canvas.draw_idle()
-
-            # Re-enable the right-drag zoomer
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self._roi_zoom_sel and self._roi_zoom_sel.set_active(True))
-
-    def _zoom_to_roi_if_exists(self):
-        """Used by cluster toggles: zoom to ROI only if a rectangle already exists."""
-        if hasattr(self, "_last_rect"):
-            self._zoom_to_roi()
-
-    def _zoom_to_roi(self):
-        """Zoom BOTH heatmaps to the current rectangle ROI (if any), preserving overlays."""
-        if not hasattr(self, "_last_rect"):
-            return
-        x0, y0, x1, y1 = self._last_rect
-        # set limits on BOTH canvases (origin='upper')
-        for ax in (self.roi_ax, self.map_ax):
-            ax.set_xlim(x0, x1)
-            ax.set_ylim(y1, y0)
-        # keep the focus hatched overlays aligned with current rect
-        self._update_roi_overlays(clear_only=False)
-        self.roi_canvas.draw_idle()
-        self.map_canvas.draw_idle()
-
-    def _reset_roi_bars(self):
-        """Set the ROI channel bars to cover ALL channels (keep the gray band visible)."""
-        x, _, _ = self._x_axis()
-        lo, hi = float(x.min()), float(x.max())
-        # this emits spanChanged → updates heatmaps + bands everywhere
-        self._set_span(lo, hi)
-        # Ensure the persistent gray bands are displayed everywhere
-        self._update_all_row_span_overlays()
 
     # ---------------- Exports ----------------
     def _save_spectra_png(self):
@@ -2566,15 +2609,16 @@ class SpectraRoiDialog(QDialog):
 
         x, _, _ = self._x_axis()
         out = {"x": x}
-        mask = np.ones(self.N, dtype=bool)  # Export from Spectra tab uses ALL pixel
         agg = self.agg_combo.currentText()
+        if agg == "sum":
+            mats = self._sum_by_cluster
+        else:
+            denom = np.maximum(1, self._cnt_by_cluster).astype(np.float32)[:, None]
+            mats = self._sum_by_cluster / denom
+
         for r, row in enumerate(self.rows, start=1):
             for cid in sorted(row["clusters"]):
-                idx = (self.labels == cid) & mask
-                if not np.any(idx): continue
-                Y = self.spectra[idx]
-                y = np.nanmean(Y, axis=0) if agg=="mean" else np.nansum(Y, axis=0)
-                out[f"row{r}_cluster{cid}"] = y
+                out[f"row{r}_cluster{cid}"] = mats[cid]
 
         df = pd.DataFrame(out)
         if opts.get("log_safe", False):
@@ -2611,14 +2655,66 @@ class SpectraRoiDialog(QDialog):
                 QMessageBox.critical(self, "Export error", str(e))
 
     def _save_heatmap_png(self):
+        """
+        Export a PNG grid of the ROI tab:
+        upper-left: enabled-clusters heatmap
+        upper-right: all-clusters heatmap
+        bottom: ROI spectra with gray span bands (if any).
+        """
         fd = QFileDialog(self); fd.setOption(QFileDialog.DontUseNativeDialog, True)
         fd.setAcceptMode(QFileDialog.AcceptSave)
-        fd.setNameFilter("PNG Images (*.png)"); fd.selectFile("heatmap.png")
+        fd.setNameFilter("PNG Images (*.png)"); fd.selectFile("roi_panel.png")
         if fd.exec() != QFileDialog.Accepted: return
         path = fd.selectedFiles()[0]
         if not path.lower().endswith(".png"): path += ".png"
-        try: self.map_fig.savefig(path, dpi=200)
-        except Exception as e: QMessageBox.critical(self, "Export error", str(e))
+
+        # Compose a new figure (keeps current views & color scales)
+        fig = Figure(figsize=(11.5, 8.0), constrained_layout=True)
+        canv = FigureCanvas(fig)
+
+        gs = fig.add_gridspec(2, 2, height_ratios=[1, 0.7])
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax3 = fig.add_subplot(gs[1, :])
+
+        # copy images with clim and cmap
+        im1 = ax1.imshow(self._im_focus.get_array(), cmap=self._im_focus.get_cmap(),
+                         origin='upper', interpolation='nearest', clim=self._im_focus.get_clim())
+        ax1.set_title("Heatmap (enabled clusters)")
+        fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.03)
+
+        im2 = ax2.imshow(self._im_global.get_array(), cmap=self._im_global.get_cmap(),
+                         origin='upper', interpolation='nearest', clim=self._im_global.get_clim())
+        ax2.set_title("Heatmap (all clusters)")
+        fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.03)
+
+        # spectra: redraw quickly from current axis
+        x, xlabel, _ = self._x_axis()
+        lines = self.roi_spec_ax.get_lines()
+        for ln in lines:
+            ax3.plot(ln.get_xdata(), ln.get_ydata(), color=ln.get_color(), lw=ln.get_linewidth(),
+                     label=ln.get_label())
+        ax3.set_xlabel(xlabel)
+        yl = self.roi_spec_ax.get_ylabel()
+        if yl: ax3.set_ylabel(yl)
+        ax3.set_yscale(self.roi_spec_ax.get_yscale())
+        ax3.grid(True, alpha=0.25)
+        ax3.set_xlim(*self.roi_spec_ax.get_xlim())
+        ax3.set_ylim(*self.roi_spec_ax.get_ylim())
+        if ax3.get_legend_handles_labels()[1]:
+            ax3.legend(loc="best", fontsize=8)
+
+        # span band
+        try:
+            lo, hi = self._span_lohi_in_axis_units()
+            ax3.axvspan(lo, hi, ymin=0.0, ymax=1.0, color="k", alpha=0.08, zorder=0)
+        except Exception:
+            pass
+
+        try:
+            fig.savefig(path, dpi=200)
+        except Exception as e:
+            QMessageBox.critical(self, "Export error", str(e))
 
     def _export_heatmap_csv(self):
         fd = QFileDialog(self); fd.setOption(QFileDialog.DontUseNativeDialog, True)
@@ -2628,8 +2724,10 @@ class SpectraRoiDialog(QDialog):
         path = fd.selectedFiles()[0]
         if not path.lower().endswith(".csv"): path += ".csv"
         try:
-            img = self._heatmap_array(keep_clusters=None)
-            yy, xx = np.indices(img.shape)
+            vals = self._heatmap_vector_for_span()
+            img = np.zeros((self.H, self.W), dtype=np.float32)
+            img[self._ys, self._xs] = vals
+            yy, xx = np.indices(img.shape, dtype=np.int32)
             df = pd.DataFrame({"X":xx.ravel(), "Y":yy.ravel(), "Value":img.ravel()})
             df.to_csv(path, index=False)
         except Exception as e:

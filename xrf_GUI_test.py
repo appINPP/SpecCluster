@@ -89,7 +89,8 @@ class ImageCanvas(FigureCanvas):
         self.ax.clear()
         self.ax.text(0.5, 0.5, label, ha='center', va='center', fontsize=12)
         self.draw()
-    
+
+
 
 class XRFGui(QMainWindow):
     def __init__(self):
@@ -111,6 +112,7 @@ class XRFGui(QMainWindow):
         self._spectra_use_mean = False
         self._spectra_current = None      # list of arrays currently plotted
         self._spectra_agg_combo = None    # the Sum/Mean dropdown in the dialog
+        self._sil_cache = {}   # key: (id(df), n, d, tuple(kvals), pca_dim, sample_size) -> (kvals, scores)
 
     def load_dataset_qt(self):
         df = elemental_conversion_qt(parent=self)
@@ -1500,86 +1502,263 @@ class XRFGui(QMainWindow):
         return proj, source
 
     def show_silhouette_popup(self):
-        # 1) Get the same base used for clustering
+        """
+        Silhouette sweep with aligned logic:
+        • Method:
+            - "Full (slow, no PCA)": silhouette on ALL points (no PCA, no sampling)
+            - "Fast — sample only": silhouette on a stratified sample; no PCA
+            - "Fast — PCA + sample": randomized PCA then silhouette on a stratified sample
+        • Clusterer (for ALL methods): KMeans (exact) or MiniBatchKMeans (fast)
+        • Controls: k-range, PCA dims, sample size or %, seed
+        • Caching uses all knobs to avoid cross-contamination
+        """
+        import numpy as np
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSpinBox,
+            QDoubleSpinBox, QCheckBox, QDialogButtonBox
+        )
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+
+        # --- matrix used for clustering in your app (keep this helper in your class)
         try:
             X, base_name = self._get_clustering_base_matrix()
         except Exception as e:
-            self.log_output.append(f"Silhouette: {e}")
+            try: self.log_output.append(f"Silhouette: {e}")
+            except Exception: pass
             return
 
-        n_samples = X.shape[0]
-        if n_samples < 3:
-            self.log_output.append("Silhouette: need at least 3 samples.")
+        X = np.asarray(X)
+        if X.ndim != 2 or X.shape[0] < 3:
+            try: self.log_output.append("Silhouette: need a 2D matrix with at least 3 rows.")
+            except Exception: pass
             return
 
-        # Choose a reasonable k sweep
-        k_min = 2
-        k_max = min(10, max(2, n_samples - 1))  # cap to 10 to keep it quick
-        k_values = list(range(k_min, k_max + 1))
+        n, d = X.shape
 
-        # 2) Compute scores
-        scores = []
-        for k in k_values:
-            try:
-                model = KMeans(n_clusters=k, random_state=0)
-                labels = model.fit_predict(X)
-                # Silhouette requires at least 2 labels present
-                if len(np.unique(labels)) < 2 or len(np.unique(labels)) > n_samples - 1:
-                    scores.append(np.nan)
-                    continue
-                s = silhouette_score(X, labels, metric="euclidean")
-                scores.append(s)
-            except Exception as ex:
-                self.log_output.append(f"Silhouette(k={k}) failed: {ex}")
-                scores.append(np.nan)
+        # lazy imports (faster app startup)
+        from sklearn.cluster import KMeans, MiniBatchKMeans
+        from sklearn.metrics import silhouette_score
+        from sklearn.decomposition import PCA
 
-        # If everything failed, bail
-        if not np.isfinite(scores).any():
-            self.log_output.append("Silhouette: no valid scores in range.")
-            return
-
-        # 3) Pick best k
-        best_idx = int(np.nanargmax(scores))
-        best_k = k_values[best_idx]
-        best_score = float(scores[best_idx])
-
-        # 4) Build a Qt popup with a Matplotlib plot
+        # -------- dialog UI --------
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Silhouette sweep — base: {base_name}")
-        dlg.resize(700, 400)
         vbox = QVBoxLayout(dlg)
 
-        # Plot
-        fig = Figure(figsize=(6, 3))
-        canvas = FigureCanvas(fig)
-        ax = fig.add_subplot(111)
-        ax.plot(k_values, scores, marker='o')
-        ax.axvline(best_k, color='r', linestyle='--', label=f"Best k = {best_k}")
-        ax.set_title("Silhouette Score vs k")
-        ax.set_xlabel("k (number of clusters)")
-        ax.set_ylabel("Silhouette score")
-        ax.legend()
-        fig.tight_layout()
-        canvas.draw()
-        vbox.addWidget(canvas)
+        # Clusterer row (new)
+        cl_row = QHBoxLayout()
+        cl_row.addWidget(QLabel("Clusterer:"))
+        clusterer = QComboBox()
+        clusterer.addItems(["KMeans (exact)", "MiniBatchKMeans (fast)"])
+        clusterer.setCurrentIndex(0)  # default to exact for alignment
+        cl_row.addWidget(clusterer, 1)
+        vbox.addLayout(cl_row)
 
-        # Info + buttons
-        info = QLabel(f"Best k = {best_k} (score = {best_score:.3f})")
+        # Method row
+        method_row = QHBoxLayout()
+        method_row.addWidget(QLabel("Method:"))
+        method = QComboBox()
+        method.addItems([
+            "Full (slow, no PCA)",
+            "Fast — sample only",
+            "Fast — PCA + sample",
+        ])
+        method_row.addWidget(method, 1)
+        vbox.addLayout(method_row)
+
+        # k-range
+        k_row = QHBoxLayout()
+        k_row.addWidget(QLabel("k min:")); kmin = QSpinBox(); kmin.setRange(2, max(2, n-1)); kmin.setValue(2); k_row.addWidget(kmin)
+        k_row.addSpacing(12)
+        k_row.addWidget(QLabel("k max:")); kmax = QSpinBox(); kmax.setRange(3, max(3, n)); kmax.setValue(min(12, max(3, n))); k_row.addWidget(kmax)
+        k_row.addStretch(1)
+        vbox.addLayout(k_row)
+
+        # PCA dims (only for PCA+sample)
+        pca_row = QHBoxLayout()
+        pca_row.addWidget(QLabel("PCA dims:"))
+        pca_dims = QSpinBox(); pca_dims.setRange(1, max(1, d)); pca_dims.setValue(min(20, d))
+        pca_row.addWidget(pca_dims); pca_row.addStretch(1)
+        vbox.addLayout(pca_row)
+
+        # Sampling controls
+        samp_row = QHBoxLayout()
+        total_label = QLabel(f"N total: {n:,}"); samp_row.addWidget(total_label); samp_row.addSpacing(18)
+        use_percent = QCheckBox("Use % of data"); samp_row.addWidget(use_percent)
+        samp_row.addSpacing(12); samp_row.addWidget(QLabel("Sample size:"))
+        sample_n = QSpinBox(); sample_n.setRange(2, n); sample_n.setValue(min(5000, n)); samp_row.addWidget(sample_n)
+        samp_row.addSpacing(12); samp_row.addWidget(QLabel("%:"))
+        sample_pct = QDoubleSpinBox(); sample_pct.setRange(0.1, 100.0); sample_pct.setSingleStep(1.0); sample_pct.setValue(10.0); samp_row.addWidget(sample_pct)
+        samp_row.addStretch(1)
+        vbox.addLayout(samp_row)
+
+        # Seed
+        seed_row = QHBoxLayout()
+        seed_row.addWidget(QLabel("Random seed:"))
+        seed = QSpinBox(); seed.setRange(0, 10_000_000); seed.setValue(0); seed_row.addWidget(seed)
+        seed_row.addStretch(1)
+        vbox.addLayout(seed_row)
+
+        info = QLabel("Ready."); info.setStyleSheet("color: gray;")
         vbox.addWidget(info)
 
+        fig = Figure(figsize=(6.2, 3.4), constrained_layout=True)
+        canvas = FigureCanvas(fig); ax = fig.add_subplot(111)
+        vbox.addWidget(canvas)
+
         btns = QDialogButtonBox(dlg)
-        use_btn = btns.addButton(f"Use k = {best_k}", QDialogButtonBox.ActionRole)
+        run_btn   = btns.addButton("Run", QDialogButtonBox.ActionRole)
+        usek_btn  = btns.addButton("Use best k", QDialogButtonBox.ActionRole); usek_btn.setEnabled(False)
         close_btn = btns.addButton(QDialogButtonBox.Close)
         vbox.addWidget(btns)
 
-        def _apply_k():
-            self.cluster_count_spin.setValue(best_k)
-            dlg.accept()
+        # -------- helpers --------
+        def _toggle_enables():
+            m = method.currentIndex()
+            pca_dims.setEnabled(m == 2)
+            sampling_on = (m in (1, 2))
+            use_percent.setEnabled(sampling_on)
+            if sampling_on:
+                sample_n.setEnabled(not use_percent.isChecked())
+                sample_pct.setEnabled(use_percent.isChecked())
+            else:
+                sample_n.setEnabled(False); sample_pct.setEnabled(False)
 
-        use_btn.clicked.connect(_apply_k)
+        def _eval_n():
+            if method.currentIndex() in (1, 2):
+                return max(2, int(np.ceil(n * (sample_pct.value() / 100.0)))) if use_percent.isChecked() else max(2, int(sample_n.value()))
+            return n
+
+        def _cache_key(kvals, evaln):
+            return (
+                base_name, n, d,
+                method.currentIndex(),
+                clusterer.currentIndex(),
+                (int(pca_dims.value()) if method.currentIndex() == 2 else 0),
+                int(evaln),
+                int(seed.value()),
+                tuple(kvals),
+            )
+
+        def _fit_clusterer(k, Xr, seed_val):
+            if clusterer.currentIndex() == 0:
+                return KMeans(n_clusters=k, random_state=seed_val, n_init=10, max_iter=300)
+            else:
+                return MiniBatchKMeans(
+                    n_clusters=k, random_state=seed_val,
+                    batch_size=min(4096, max(512, Xr.shape[0] // 8)),
+                    n_init=10, max_iter=300
+                )
+
+        def _stratified_indices(labels, take, rng):
+            """Return indices of a stratified sample of size 'take' over labels."""
+            nL = labels.size
+            if take >= nL: return None  # means: use full
+            uniq, cnt = np.unique(labels, return_counts=True)
+            # allocate proportionally, keep at least 2 if possible
+            out = []
+            remaining = take
+            for u, c in zip(uniq, cnt):
+                want = int(round(take * (c / nL)))
+                want = min(c, max(1, want))
+                idx_u = np.flatnonzero(labels == u)
+                choose = rng.choice(idx_u, size=want, replace=False)
+                out.append(choose); remaining -= choose.size
+            if remaining > 0:
+                pool = np.setdiff1d(np.arange(nL), np.concatenate(out), assume_unique=False)
+                extra = rng.choice(pool, size=remaining, replace=False)
+                out.append(extra)
+            return np.concatenate(out)
+
+        _toggle_enables()
+        method.currentIndexChanged.connect(_toggle_enables)
+        use_percent.toggled.connect(_toggle_enables)
+
+        # -------- run logic --------
+        _best_k = None
+
+        def _run():
+            nonlocal _best_k
+            lo, hi = int(kmin.value()), int(kmax.value())
+            if lo >= hi:
+                info.setText("k-min must be < k-max.")
+                return
+            kvals = list(range(lo, hi + 1))
+            evaln = _eval_n()
+            seed_val = int(seed.value())
+
+            Xbase = X.astype(np.float32, copy=False)
+            m = method.currentIndex()
+
+            # PCA only in mode 2
+            if m == 2:
+                dcap = int(pca_dims.value())
+                dcap = max(1, min(dcap, Xbase.shape[1]))
+                p = PCA(n_components=dcap, svd_solver="randomized", random_state=seed_val)
+                Xr = p.fit_transform(Xbase).astype(np.float32, copy=False)
+            else:
+                Xr = Xbase
+
+            # cache
+            key = _cache_key(kvals, evaln)
+            if not hasattr(self, "_sil_cache"): self._sil_cache = {}
+            if key in self._sil_cache:
+                kvalsC, scores = self._sil_cache[key]
+            else:
+                from sklearn.metrics import silhouette_score
+                rng = np.random.default_rng(seed_val)
+                scores = []
+                for k in kvals:
+                    # fit on FULL Xr with chosen clusterer (aligns logic across modes)
+                    km = _fit_clusterer(k, Xr, seed_val)
+                    labels_full = km.fit_predict(Xr)
+                    # choose eval slice: full for method 0, stratified subset otherwise
+                    if m == 0 or evaln >= Xr.shape[0]:
+                        idx = None
+                        X_eval = Xr
+                        labels_eval = labels_full
+                    else:
+                        idx = _stratified_indices(labels_full, evaln, rng)
+                        X_eval = Xr[idx]
+                        labels_eval = labels_full[idx]
+                    if np.unique(labels_eval).size < 2:
+                        scores.append(np.nan); continue
+                    s = silhouette_score(X_eval, labels_eval, metric="euclidean")
+                    scores.append(float(s))
+                self._sil_cache[key] = (tuple(kvals), list(scores))
+
+            # plot
+            ax.clear()
+            ax.plot(kvals, scores, marker="o", lw=1.2)
+            if np.isfinite(scores).any():
+                bi = int(np.nanargmax(scores)); _best_k = int(kvals[bi]); ax.axvline(_best_k, ls="--")
+                usek_btn.setEnabled(True)
+            else:
+                _best_k = None; usek_btn.setEnabled(False)
+            ax.set_xlabel("k"); ax.set_ylabel("silhouette"); ax.grid(True, alpha=0.25)
+            canvas.draw()
+
+            used_dims = Xr.shape[1]
+            mode_txt = ["Full", "Fast(sample)", "Fast(PCA+sample)"][m]
+            cl_txt = ["KMeans", "MiniBatchKMeans"][clusterer.currentIndex()]
+            info.setText(
+                f"{mode_txt} | {cl_txt} | n={n:,}, d={d} → used dims={used_dims}, eval n={(Xr.shape[0] if m==0 else evaln):,}"
+                + (f" | best k={_best_k}" if _best_k is not None else "")
+            )
+
+        def _apply_best_k():
+            if _best_k is not None and hasattr(self, "cluster_count_spin"):
+                self.cluster_count_spin.setValue(int(_best_k))
+                dlg.accept()
+
+        run_btn.clicked.connect(_run)
+        usek_btn.clicked.connect(_apply_best_k)
         close_btn.clicked.connect(dlg.reject)
 
-        dlg.exec()
+        dlg.resize(800, 540)
+        dlg.setModal(False)
+        dlg.show()
 
     def show_db_score_popup(self):
         # 1) Use the same base as clustering
