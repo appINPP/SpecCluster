@@ -3,7 +3,7 @@
 ## Abstract
 A desktop app for **interactive clustering and exploration of X‑ray fluorescence (XRF)** maps and spectra. Load HDF5 scans with a CFG fit (via PyMca’s FastXRFLinearFit) or import a prebuilt `images.csv`, then filter, fuse features (optionally add XY), project (PCA/NMF/t‑SNE/UMAP), cluster (K‑means), and interpret results with **per‑cluster spectra**, **ROI tools**, and **cluster×element heatmaps**. The UI favors clarity (outlines, legend, stable colors), reproducibility (explicit parameters, no hidden resorting), and predictable memory (streamed spectra, cached Moran’s I).
 
-## Check the Instructions video
+## Check Out the Instructions Video
 https://youtu.be/OEp86lLKPew
 
 ## Usage
