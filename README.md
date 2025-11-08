@@ -1,7 +1,7 @@
-# XRF Imaging GUI
+# SpecCluster (XRF Clustering and Imaging GUI)
 
 ## Abstract
-A desktop app for **interactive clustering and exploration of X‑ray fluorescence (XRF)** maps and spectra. Load HDF5 scans with a CFG fit (via PyMca’s FastXRFLinearFit) or import a prebuilt `images.csv`, then filter, fuse features (optionally add XY), project (PCA/NMF/t‑SNE/UMAP), cluster (K‑means), and interpret results with **per‑cluster spectra**, **ROI tools**, and **cluster×element heatmaps**. The UI favors clarity (outlines, legend, stable colors), reproducibility (explicit parameters, no hidden resorting), and predictable memory (streamed spectra, cached Moran’s I).
+A desktop app for **interactive clustering and exploration of X‑ray fluorescence (XRF)** maps and spectra. Load HDF5 scans with a CFG fit (via PyMca’s FastXRFLinearFit) or import a prebuilt images file (`images.csv` which is created by the fit), then filter, fuse features (optionally add XY), project (PCA/NMF/t‑SNE/UMAP), cluster (K‑means), and interpret results with **per‑cluster spectra**, **ROI tools**, and **cluster×element heatmaps**. The UI favors clarity (outlines, legend, stable colors), reproducibility (explicit parameters, no hidden resorting), and predictable memory (streamed spectra, cached Moran’s I).
 
 ## Check Out the Instructions Video
 https://youtu.be/OEp86lLKPew
@@ -9,8 +9,9 @@ https://youtu.be/OEp86lLKPew
 ## Usage
 1. **Launch**
    ```bash
-   python xrf_GUI_test.py
+   python xrf_GUI.py
    ```
+   - Or use VS code as shown in the instructions video.
 
 2. **Load data**
    - **Load from HDF…** → pick HDF/H5 and CFG, select the dataset path `(rows × cols × channels)`.  
@@ -20,13 +21,14 @@ https://youtu.be/OEp86lLKPew
 
 3. **(Optional) Filter**
    - **Moran’s I** to keep spatially coherent elements (cached).
-   - **Foreground clustering** + **Element map** to include/exclude elements.
+   - **Foreground/Background clustering**
+   - **Element map** to view and also include/exclude elements.
 
 4. **(Optional) Feature fusion**
    - **Add XY** (then scale), **Scale** (Standard/MinMax), **Augment** (separate scalers & weights for elements vs XY).
 
 5. **Projections**
-   - PCA, NMF, t‑SNE (perplexity), UMAP (metric picker with options for Mahalanobis/wMinkowski/seuclidean).
+   - PCA, NMF, t‑SNE (perplexity), UMAP (metric picker with options for Mahalanobis/wMinkowski/seuclidean and more).
 
 6. **Clustering**
    - Choose *k* and **base** (dataset or any projection).  
@@ -90,5 +92,5 @@ This project is licensed under the Apache License. See the LICENSE for details.
 ```
 
 ## Citation
-If this tool supports your research, please cite the repository (XRF clustering & visualization GUI).
+If this tool supports your research, please cite the repository (SpecCluster).
 
