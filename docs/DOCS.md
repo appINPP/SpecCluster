@@ -1,4 +1,4 @@
-# XRF Imaging GUI
+# SpecCluster
 
 An open-source desktop app for **interactive clustering and exploration of X-ray fluorescence (XRF) maps and spectra**—built to be reliable, transparent, and easy to use.
 
@@ -91,7 +91,7 @@ python xrf_GUI_test.py
     The preview reflects the current base used for projections or clustering.
 
 3. **Filter (optional)** 
-    → **Moran’s I** filter to keep spatially coherent elements. Results are cached; re-runs avoid recomputation. Set the Moran's I value to 0, in order to see the list of scores.
+    → **Moran’s I** filter to keep spatially coherent elements. Results are cached; re-runs avoid recomputation. Set the Moran's I value to 0, in order to see the list of scores. Setting it to any other value will just select this file.
     → **Foreground Clustering** clusters on per-element mean/std to attemp on separating foreground vs background.
     → **Element map** manually select which elements participate in clustering.
 
@@ -103,10 +103,10 @@ python xrf_GUI_test.py
 5. **Projections** → choose components and methods; for UMAP select a **metric** (with per-metric options if needed).
 
 6. **Clustering** → choose *k* clusters, choose the **base** (dataset or any projection), and run K-means.
-   - Check **Silhouette**/**DB** curves to choose a sensible *k*. DB is faster but Silhouette is built within a module that can significantly reduce the time needed. Within the module, the user can choose to run the silhouette score on a sample/percentage of the dataset. There is also the option to decrease dimentionality or use MiniBatchKMeans.
+   - Check **Silhouette**/**DB** curves to choose a sensible *k*. DB is faster but Silhouette is built within a module that can significantly reduce the time needed for a normal Silhouette score computation. Within the module, the user can choose to run the silhouette score on a sample/percentage of the dataset. There is also the option to decrease dimentionality or to use MiniBatchKMeans.
 
 7. **Inspect**
-   - Left canvas: cluster outlines, legend, visibility toggles, color editor.
+   - Left canvas: Pixel map. Cluster outlines, legend with cluster information.
    - Right canvas: projections; click to de-highlight points.
 
 8. **Analyze**
@@ -175,14 +175,5 @@ python xrf_GUI_test.py
 ### Concentrations Module
 ![Concentrations Module](./Concentrations_module.png)
 *Cluster × element heatmaps (mean/median/sum), annotations, and export.*
-
----
-
-## 🤝 Contributing
-
-Issues and PRs are welcome:
-- Keep UI changes consistent with the existing layout and “explicit > implicit” philosophy.
-- Prefer small, focused PRs (one feature/fix).
-- Add a short note in the log for new pipeline steps or parameters.
 
 ---
