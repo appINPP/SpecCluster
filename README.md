@@ -1,7 +1,7 @@
 # SpecCluster (XRF Clustering and Imaging GUI)
 
 ## Abstract
-A desktop app for **interactive clustering and exploration of X‑ray fluorescence (XRF)** maps and spectra. Load HDF5 scans with a CFG fit (via PyMca’s FastXRFLinearFit) or import a prebuilt images file (`images.csv` which is created by the fit), then filter, fuse features (optionally add XY), project (PCA/NMF/t‑SNE/UMAP), cluster (K‑means), and interpret results with **per‑cluster spectra**, **ROI tools**, and **cluster×element heatmaps**. The UI favors clarity (outlines, legend, stable colors), reproducibility (explicit parameters, no hidden resorting), and predictable memory (streamed spectra, cached Moran’s I).
+A desktop app for **interactive clustering and exploration of spectra and X‑ray fluorescence (XRF)** maps. Load HDF5 scans with a CFG fit (via PyMca’s FastXRFLinearFit) or import a prebuilt images file (`images.csv` which is created by the fit), then filter, fuse features (optionally add XY), project (PCA/NMF/t‑SNE/UMAP), cluster (K‑means), and interpret results with **per‑cluster spectra**, **ROI tools**, and **cluster×element heatmaps**. The UI favors clarity (outlines, legend, stable colors), reproducibility (explicit parameters, no hidden resorting), and predictable memory (streamed spectra, cached Moran’s I).
 
 ## Check Out the Instructions Video
 https://youtu.be/OEp86lLKPew
