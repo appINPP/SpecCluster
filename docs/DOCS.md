@@ -156,10 +156,6 @@ python xrf_GUI_test.py
 ![GUI](./General_UI.png)
 *Primary layout: image canvas (left) and projection canvas (right).*
 
-### Element Selection
-![Element Selection](./Element_Map.png)
-*Per-element images with search and display controls; choose elements for clustering.*
-
 ### Silhouette Module
 ![Silhouette Module](./Silhouette_score_module.png)
 *Interactive Silhouette evaluation (supports sampling, dimensionality reduction, and MiniBatchKMeans).*
